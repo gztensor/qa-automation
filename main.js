@@ -4,9 +4,9 @@ import { StakeContract } from './stakeContract.js';
 import { UnstakeContract } from './unstakeContract.js';
 import { randInt } from './utils.js';
 import { ContractCallLogger } from './testjournal.js';
-import { checkKeysUidsConstraints } from './constraints.js';
+import { checkKeysUidsConstraints, checkWeightsBondsConstraints } from './constraints.js';
 
-const ENDPOINT = 'ws://127.0.0.1:9946';
+const ENDPOINT = 'wss://entrypoint-finney.opentensor.ai';
 // const ENDPOINT = 'wss://archive.chain.opentensor.ai';
 
 async function chooseContractParameters(contract) {
@@ -32,7 +32,7 @@ async function chooseContractParameters(contract) {
 
 function integrateProbabilities(testProbabilities) {
   let acc = 0;
-  for (let i=0; i<testProbabilities.length; i+=1) {
+  for (let i = 0; i < testProbabilities.length; i += 1) {
     acc += testProbabilities[i][0];
     testProbabilities[i][0] = acc;
   }
@@ -46,8 +46,14 @@ async function main() {
   console.log('Connected to', ENDPOINT);
   const logger = new ContractCallLogger();
 
-  const constraintsOk = await checkKeysUidsConstraints(api);
-  console.log(`constraintsOk = ${constraintsOk}`);
+  const keysUidsOk = await checkKeysUidsConstraints(api);
+  console.log(`Keys-Uids constraints OK = ${keysUidsOk}`);
+
+  const weightsBondsOk = await checkWeightsBondsConstraints(api);
+  console.log(`Weights-Bonds constraints OK = ${weightsBondsOk}`);
+
+  const constraintsOk =  keysUidsOk && weightsBondsOk;
+  console.log(`Overall constraints OK = ${constraintsOk}`);
 
   // while (true) {
   //   try {
