@@ -7,6 +7,7 @@ import { ContractCallLogger } from './testjournal.js';
 import { checkKeysUidsConstraints } from './constraints.js';
 
 const ENDPOINT = 'ws://127.0.0.1:9946';
+// const ENDPOINT = 'wss://archive.chain.opentensor.ai';
 
 async function chooseContractParameters(contract) {
   const prmCount = contract.parameterCount;
@@ -48,49 +49,49 @@ async function main() {
   const constraintsOk = await checkKeysUidsConstraints(api);
   console.log(`constraintsOk = ${constraintsOk}`);
 
-  while (true) {
-    try {
-      // System creates vector-store from the base branch
-      // System collects the PR diff
-      // System collects all available tests and their code coverage (top level fn tested)
-      // LLM decides what tests to prioritize based on the code base, the diff and the test code coverage.
-      // TODO later
+  // while (true) {
+  //   try {
+  //     // System creates vector-store from the base branch
+  //     // System collects the PR diff
+  //     // System collects all available tests and their code coverage (top level fn tested)
+  //     // LLM decides what tests to prioritize based on the code base, the diff and the test code coverage.
+  //     // TODO later
 
-      const testProbabilities = integrateProbabilities([
-        [0.2, TransferContract],
-        [0.4, StakeContract],
-        [0.4, UnstakeContract],
-      ]);
+  //     const testProbabilities = integrateProbabilities([
+  //       [0.2, TransferContract],
+  //       [0.4, StakeContract],
+  //       [0.4, UnstakeContract],
+  //     ]);
 
-      // System chooses one test to run (with probability proposed by the LLM).
-      const r = Math.random();
-      const [, cls] = testProbabilities.find(([t]) => r <= t) ?? testProbabilities.at(-1);
-      const contract = new cls(api);
+  //     // System chooses one test to run (with probability proposed by the LLM).
+  //     const r = Math.random();
+  //     const [, cls] = testProbabilities.find(([t]) => r <= t) ?? testProbabilities.at(-1);
+  //     const contract = new cls(api);
 
-      // Choose contract parameters
-      const contractPrm = await chooseContractParameters(contract);
-      console.log(`${cls.name}: ${JSON.stringify(contractPrm)}`);
-      if (contractPrm === null) continue;
+  //     // Choose contract parameters
+  //     const contractPrm = await chooseContractParameters(contract);
+  //     console.log(`${cls.name}: ${JSON.stringify(contractPrm)}`);
+  //     if (contractPrm === null) continue;
 
-      // Execute workflow
-      const result = await contract.executeFlow({ params: contractPrm });
+  //     // Execute workflow
+  //     const result = await contract.executeFlow({ params: contractPrm });
 
-      if (result.ok) {
-        console.log('✅ Contract executed successfully');
-        console.log('Action result:', result.actionResult);
-        await logger.logContractCallOk(contractPrm);
-      } else {
-        console.error('❌ Contract failed');
-        console.error('Stage:', result.stage);
-        if (result.prompt) console.error('Prompt (debug):\n', result.prompt);
-        console.error('Error:', result.error);
-        await logger.logContractCallErr(`Parameters: ${contractPrm}, Error: ${result.error}`);
-      }
+  //     if (result.ok) {
+  //       console.log('✅ Contract executed successfully');
+  //       console.log('Action result:', result.actionResult);
+  //       await logger.logContractCallOk(contractPrm);
+  //     } else {
+  //       console.error('❌ Contract failed');
+  //       console.error('Stage:', result.stage);
+  //       if (result.prompt) console.error('Prompt (debug):\n', result.prompt);
+  //       console.error('Error:', result.error);
+  //       await logger.logContractCallErr(`Parameters: ${contractPrm}, Error: ${result.error}`);
+  //     }
 
-    } catch (err) {
-      console.error('Error:', err);
-    }
-  };
+  //   } catch (err) {
+  //     console.error('Error:', err);
+  //   }
+  // };
 
   await api.disconnect();
 }
