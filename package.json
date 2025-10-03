@@ -1,0 +1,22 @@
+{
+  "name": "subtensor-qa-automation",
+  "version": "1.0.0",
+  "description": "Scripts that automate testing that is usually done manually",
+  "scripts": {},
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@babel/runtime": "^7.25.0",
+    "@polkadot/api": "16.4.8",
+    "@polkadot/keyring": "12.2.1",
+    "@polkadot/util": "^13.0.2",
+    "@polkadot/util-crypto": "^13.0.2",
+    "dotenv": "^17.2.3",
+    "fs": "^0.0.1-security",
+    "globby": "^15.0.0",
+    "ignore": "^7.0.5",
+    "net": "^1.0.2",
+    "openai": "^6.0.0"
+  },
+  "type": "module"
+}

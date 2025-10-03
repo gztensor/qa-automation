@@ -1,0 +1,14 @@
+support
+evm-tests
+.github
+scripts
+chainspecs
+.devcontainer
+zepter.yaml
+snapshot.json
+recipe.json
+docker-compose.yml
+docker-compose.localnet.yml
+CONTRIBUTING.md
+docs
+README.md
