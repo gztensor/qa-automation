@@ -875,3 +875,140 @@ export async function checkValidatorPermits(api) {
 
   return ok;
 }
+
+
+export async function checkSimpleLimits(api) {
+  // ---------- helpers ----------
+  const toNum = (x) => (typeof x?.toNumber === 'function' ? x.toNumber() : Number(x));
+  const toStr = (x) => (x?.toString ? x.toString() : String(x));
+
+  let overallOk = true;
+  const err = (msg) => { console.log(`Constraint error: ${msg}`); overallOk = false; };
+
+  try {
+    // 1. NetworksAdded length equals TotalNetworks, and non-root subnets <= SubnetLimit
+    // Note: Root network (netuid 0) doesn't count against SubnetLimit
+    {
+      const totalNetworks = toNum(await api.query.subtensorModule.totalNetworks());
+      const networksAddedEntries = await api.query.subtensorModule.networksAdded.entries();
+      const addedNetworks = networksAddedEntries.filter(([_, v]) => v === true || v?.isTrue === true);
+      const addedNetworkCount = addedNetworks.length;
+      
+      // Check that NetworksAdded count matches TotalNetworks
+      if (addedNetworkCount !== totalNetworks) {
+        err(`1 NetworksAdded count(${addedNetworkCount}) != TotalNetworks(${totalNetworks})`);
+      }
+      
+      // Check that non-root networks don't exceed SubnetLimit
+      const ROOT_NETUID = 0;
+      const nonRootCount = addedNetworks.filter(([key, _]) => {
+        const netuid = toNum(key.args[0]);
+        return netuid !== ROOT_NETUID;
+      }).length;
+      
+      try {
+        const subnetLimit = toNum(await api.query.subtensorModule.subnetLimit());
+        if (!(nonRootCount <= subnetLimit)) {
+          err(`1 Non-root subnets count(${nonRootCount}) exceeds SubnetLimit(${subnetLimit})`);
+        }
+      } catch (e) {
+        // SubnetLimit might not be exposed, so just log the count for manual verification
+        console.log(`1 Non-root subnets = ${nonRootCount}, TotalNetworks = ${totalNetworks} (SubnetLimit not accessible via RPC)`);
+      }
+    }
+
+    // 2. BlockAtRegistration should always be <= current block
+    // Note: BlockAtRegistration is DMAP(netuid, uid) --> block_number
+    {
+      const currentBlock = toNum(await api.query.system.number());
+      const blockAtRegEntries = await api.query.subtensorModule.blockAtRegistration.entries();
+      for (const [key, value] of blockAtRegEntries) {
+        const netuid = toNum(key.args[0]);
+        const uid = toNum(key.args[1]);
+        const blockAtReg = toNum(value);
+        if (!(blockAtReg <= currentBlock)) {
+          err(`2 BlockAtRegistration(${netuid}, ${uid})=${blockAtReg} > current block ${currentBlock}`);
+        }
+      }
+    }
+
+    // 3. Hotkey take in Delegates value is between MinDelegateTake and MaxDelegateTake
+    {
+      const minDelegateTake = toNum(await api.query.subtensorModule.minDelegateTake());
+      const maxDelegateTake = toNum(await api.query.subtensorModule.maxDelegateTake());
+      const delegatesEntries = await api.query.subtensorModule.delegates.entries();
+      for (const [key, value] of delegatesEntries) {
+        const hotkey = toStr(key.args[0]);
+        const take = toNum(value);
+        if (!(take >= minDelegateTake && take <= maxDelegateTake)) {
+          err(`3 Delegates(${hotkey})=${take} is not in range [${minDelegateTake}, ${maxDelegateTake}]`);
+        }
+      }
+    }
+
+    // 4. Childkey take in ChildkeyTake map is between MinChildkeyTake and MaxChildkeyTake
+    {
+      const minChildkeyTake = toNum(await api.query.subtensorModule.minChildkeyTake());
+      const maxChildkeyTake = toNum(await api.query.subtensorModule.maxChildkeyTake());
+      const childkeyTakeEntries = await api.query.subtensorModule.childkeyTake.entries();
+      for (const [key, value] of childkeyTakeEntries) {
+        const hotkey = toStr(key.args[0]);
+        const netuid = toNum(key.args[1]);
+        const take = toNum(value);
+        if (!(take >= minChildkeyTake && take <= maxChildkeyTake)) {
+          err(`4 ChildkeyTake(${hotkey}, ${netuid})=${take} is not in range [${minChildkeyTake}, ${maxChildkeyTake}]`);
+        }
+      }
+    }
+
+    // 5. MechanismCountCurrent <= MaxMechanismCount (per netuid)
+    // MaxMechanismCount is a constant (type_value) = 2
+    {
+      const MAX_MECHANISM_COUNT = 2; // From MaxMechanismCount type_value
+      const mechanismCountEntries = await api.query.subtensorModule.mechanismCountCurrent.entries();
+      for (const [key, value] of mechanismCountEntries) {
+        const netuid = toNum(key.args[0]);
+        const mechanismCount = toNum(value);
+        if (!(mechanismCount <= MAX_MECHANISM_COUNT)) {
+          err(`5 MechanismCountCurrent(${netuid})=${mechanismCount} > MaxMechanismCount(${MAX_MECHANISM_COUNT})`);
+        }
+      }
+    }
+
+    // 6. MechanismEmissionSplit adds up to 1.0 (u16::MAX) and has vector size of MechanismCountCurrent if not None
+    {
+      const mechanismCountEntries = await api.query.subtensorModule.mechanismCountCurrent.entries();
+      for (const [key, countValue] of mechanismCountEntries) {
+        const netuid = toNum(key.args[0]);
+        const mechanismCount = toNum(countValue);
+        const emissionSplitOption = await api.query.subtensorModule.mechanismEmissionSplit(netuid);
+        
+        if (emissionSplitOption.isSome) {
+          const emissionSplit = emissionSplitOption.unwrap();
+          const splitArray = emissionSplit.toJSON ? emissionSplit.toJSON() : emissionSplit;
+          
+          // Check vector size
+          if (splitArray.length !== mechanismCount) {
+            err(`6 MechanismEmissionSplit(${netuid}) has length ${splitArray.length}, expected ${mechanismCount}`);
+          }
+          
+          // Check sum equals 1.0 (represented as u16::MAX)
+          const sum = splitArray.reduce((acc, val) => acc + toNum(val), 0);
+          const U16_MAX = 65535; // u16::MAX
+          
+          // Allow small rounding errors - within 0.1% tolerance
+          const tolerance = U16_MAX * 0.001;
+          if (Math.abs(sum - U16_MAX) > tolerance) {
+            err(`6 MechanismEmissionSplit(${netuid}) sum=${sum} does not equal u16::MAX (expected ${U16_MAX})`);
+          }
+        }
+      }
+    }
+
+  } catch (e) {
+    err(`checkSimpleLimits encountered error: ${e?.message ?? e}`);
+    return false;
+  }
+
+  return overallOk;
+}
