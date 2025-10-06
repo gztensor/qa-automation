@@ -10,7 +10,8 @@ import {
   checkParentChildRelationship,
   checkStakingConstraints,
   checkWeightsBondsConstraints,
-  checkValidatorPermits
+  checkValidatorPermits,
+  checkSimpleLimits
 } from './constraints.js';
 
 // const ENDPOINT = 'ws://127.0.0.1:9946';
@@ -57,6 +58,10 @@ async function main() {
   let keysUidsOk = true;
   // keysUidsOk = await checkKeysUidsConstraints(api);
   // console.log(`Keys-Uids constraints OK = ${keysUidsOk}`);
+  
+  let simpleLimitsOk = true;
+  // simpleLimitsOk = await checkSimpleLimits(api);
+  // console.log(`Simple limits constraints OK = ${simpleLimitsOk}`);
 
   let weightsBondsOk = true; 
   // weightsBondsOk = await checkWeightsBondsConstraints(api);
@@ -78,7 +83,7 @@ async function main() {
   validatorPermitsOk = await checkValidatorPermits(api);
   console.log(`Validator permit constraints OK = ${validatorPermitsOk}`);
 
-  const constraintsOk = keysUidsOk && weightsBondsOk && stakingOk && epochOk && parentChildOk && validatorPermitsOk;
+  const constraintsOk = keysUidsOk && simpleLimitsOk && weightsBondsOk && stakingOk && epochOk && parentChildOk && validatorPermitsOk;
   console.log(`Overall constraints OK = ${constraintsOk}`);
 
   // while (true) {
