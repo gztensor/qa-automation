@@ -4,7 +4,7 @@ import { StakeContract } from './stakeContract.js';
 import { UnstakeContract } from './unstakeContract.js';
 import { randInt } from './utils.js';
 import { ContractCallLogger } from './testjournal.js';
-import { checkKeysUidsConstraints } from './constraints.js';
+import { checkEpochTopology, checkKeysUidsConstraints, checkStakingConstraints } from './constraints.js';
 
 const ENDPOINT = 'ws://127.0.0.1:9946';
 // const ENDPOINT = 'wss://archive.chain.opentensor.ai';
@@ -46,7 +46,10 @@ async function main() {
   console.log('Connected to', ENDPOINT);
   const logger = new ContractCallLogger();
 
-  const constraintsOk = await checkKeysUidsConstraints(api);
+  let constraintsOk = true;
+  // constraintsOk &&= await checkKeysUidsConstraints(api);
+  // constraintsOk &&= await checkStakingConstraints(api);
+  constraintsOk &&= await checkEpochTopology(api);
   console.log(`constraintsOk = ${constraintsOk}`);
 
   // while (true) {

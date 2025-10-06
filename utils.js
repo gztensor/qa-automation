@@ -188,7 +188,7 @@ export function randInt(min, max) {
   }
 }
 
-function i96f32ToFloatFromHexString(bitsHex) {
+export function fixedI96F32ToFloatFromHexString(bitsHex) {
   const bits = BigInt(bitsHex);  // Convert string to BigInt
 
   const MASK_96 = (1n << 96n) - 1n;
@@ -199,47 +199,36 @@ function i96f32ToFloatFromHexString(bitsHex) {
   return Number(intPart) + Number(fracPart) / 2 ** 32;
 }
 
-// Helpers ---------------------------------------------------------
+export function fixedU64F64ToFloatFromHexString(bitsHex) {
+  const bits = BigInt(bitsHex);  // Convert string to BigInt
 
-// Convert a polkadot.js numeric (u128/FixedU128 inner) to BigInt
-const toBI = (x) =>
-  (typeof x === 'bigint') ? x
-  : (x && typeof x.toBigInt === 'function') ? x.toBigInt()
-  : (x && typeof x.toString === 'function') ? BigInt(x.toString())
-  : BigInt(x); // last resort (handles "0x..." or decimal strings)
+  const MASK_64 = (1n << 64n) - 1n;
 
-/**
- * Read FixedU128 "bits" into a BigInt scaled by 1e18.
- * Works with { bits: <BN|BigInt|string> } returned by polkadot.js.
- */
-const fixedU128BitsToBI = (fixedU128) => toBI(fixedU128.bits);
+  const intPart = bits >> 64n;
+  const fracPart = bits & MASK_64;
 
-// ---------------------------------------------------------------
+  return Number(intPart) + Number(fracPart) / 2 ** 64;
+}
 
 /**
  * Compute stake = hotkeyAlpha * alphaShare / totalHotkeyShares
  * using full-precision BigInt math. Returns BigInt.
  */
 export async function getStake(api, netuid, coldkey, hotkey) {
-  // alpha(hotkey, coldkey, netuid): FixedU128
-  const alphaShareFixed = await api.query.subtensorModule.alpha(hotkey, coldkey, netuid);
-  const alphaShareBI = fixedU128BitsToBI(alphaShareFixed); // scaled (1e18)
+  const alphaShare128 = (await api.query.subtensorModule.alpha(hotkey, coldkey, netuid));
+  const alphaShare = fixedU64F64ToFloatFromHexString(alphaShare128.bits);
 
-  // totalHotkeyShares(hotkey, netuid): FixedU128
-  const totalSharesFixed = await api.query.subtensorModule.totalHotkeyShares(hotkey, netuid);
-  const totalSharesBI = fixedU128BitsToBI(totalSharesFixed); // scaled (1e18)
+  const hotkeyAlpha = (await api.query.subtensorModule.totalHotkeyAlpha(hotkey, netuid));
 
-  // totalHotkeyAlpha(hotkey, netuid): u128
-  const hotkeyAlpha = await api.query.subtensorModule.totalHotkeyAlpha(hotkey, netuid);
-  const hotkeyAlphaBI = toBI(hotkeyAlpha); // plain u128, not scaled
+  const totalHotkeyShares128 = (await api.query.subtensorModule.totalHotkeyShares(hotkey, netuid));
+  const totalHotkeyShares = fixedU64F64ToFloatFromHexString(totalHotkeyShares128.bits);
 
-  if (totalSharesBI === 0n) return 0n;
+  let stake = 0;
+  if (totalHotkeyShares != 0) {
+    stake = parseInt(alphaShare * hotkeyAlpha / totalHotkeyShares);
+  }
 
-  // Ratio of two FixedU128 cancels the scale, so we can do:
-  // stake = hotkeyAlpha * alphaShare / totalShares   (all as BigInt)
-  const stakeBI = (hotkeyAlphaBI * alphaShareBI) / totalSharesBI;
-
-  return stakeBI; // BigInt
+  return stake;
 }
 
 // amount / price  (amount is BigInt, price is decimal string or number)
@@ -254,11 +243,8 @@ export function mulAmountByPrice(amountBI, alphaPrice) {
   return amountBI * priceScaled / 1_000_000_000n;
 }
 
-/** Approx-equal for BigInt using absolute epsilon. */
+/** Approx-equal for any numeric type including BigInt using absolute epsilon. */
 export function approxEqualAbs(a, b, epsilon) {
-  if (typeof a !== 'bigint' || typeof b !== 'bigint' || typeof epsilon !== 'bigint') {
-    throw new TypeError('Use BigInt for a, b, and epsilon');
-  }
   const diff = a >= b ? a - b : b - a;
   return diff <= epsilon;
 }

@@ -1,4 +1,4 @@
-import { subnetsAvailable } from './utils.js'
+import { approxEqualAbs, fixedU64F64ToFloatFromHexString, subnetsAvailable } from './utils.js'
 
 export async function checkKeysUidsConstraints(api) {
   // ---------- helpers ----------
@@ -224,4 +224,202 @@ export async function checkKeysUidsConstraints(api) {
   }
 
   return overallOk;
+}
+
+/**
+ * Check staking-related invariants:
+ * 1) sum_h(TotalHotkeyAlpha(h, n)) + PendingEmission(n) == SubnetAlphaOut(n)
+ * 2) For every (h, c, n) in Alpha: StakingHotkeys(c) includes h
+ * 3) For every (h, n): sum_c Alpha(h, c, n) == TotalHotkeyShares(h, n)
+ *
+ * Logs every violation and returns true iff ALL hold.
+ */
+export async function checkStakingConstraints(api) {
+  const toNum = (x) => (typeof x?.toNumber === "function" ? x.toNumber() : Number(x));
+  const toStr = (x) => (x?.toString ? x.toString() : String(x));
+
+  let overallOk = true;
+  const err = (m) => { console.log(`Constraint error: ${m}`); overallOk = false; };
+
+  // ---------- netuids ----------
+  let netuids = await subnetsAvailable(api);
+  if (netuids.length === 0) return true;
+
+  // ---------- (1) sum(TotalHotkeyAlpha(*, n)) + PendingEmission(n) == SubnetAlphaOut(n) ----------
+  const thaEntries = await api.query.subtensorModule.totalHotkeyAlpha.entries();
+  const sumThaByNet = new Map(); // n -> BigInt
+  for (const [k, v] of thaEntries) {
+    const n = toNum(k.args[1]); // args: [hot, netuid]
+    const prev = sumThaByNet.get(n) ?? 0n;
+    sumThaByNet.set(n, prev + BigInt(v));
+  }
+
+  for (const n of netuids) {
+    const sumTha = sumThaByNet.get(n) ?? 0n;
+    const pending = BigInt(await api.query.subtensorModule.pendingEmission(n));
+    const out = BigInt(await api.query.subtensorModule.subnetAlphaOut(n));
+    if (sumTha + pending !== out) {
+      err(`1 sum(TotalHotkeyAlpha(*, ${n})) + PendingEmission(${n}) != SubnetAlphaOut(${n}) (sum=${sumTha} pending=${pending} out=${out})`);
+    }
+  }
+
+  // ---------- (2) Alpha(h,c,n) => StakingHotkeys(c) includes h; and (3) sum Alpha == TotalHotkeyShares ----------
+  const pageSize = 1000;
+  let startKey;
+  const coldCache = new Map(); // cold -> Set(hot)
+  const sumAlphaByNetHot = new Map(); // `${n}|${hot}` -> raw BigInt
+  const hotPerNet = new Map(); // n -> Set(hot)
+
+  for (;;) {
+    const pageKeys = await api.query.subtensorModule.alpha.keysPaged({ args: [], pageSize, startKey });
+    if (pageKeys.length === 0) break;
+
+    const tuples = pageKeys.map((k) => [toStr(k.args[0]), toStr(k.args[1]), toNum(k.args[2])]); // [hot,cold,n]
+    const values = await api.query.subtensorModule.alpha.multi(tuples);
+
+    for (let i = 0; i < tuples.length; i++) {
+      const [hot, cold, n] = tuples[i];
+
+      const alphaShare128 = values[i];
+      const alphaShare = fixedU64F64ToFloatFromHexString(alphaShare128.bits);
+
+      // (2) stakingHotkeys(cold) must include hot
+      let set = coldCache.get(cold);
+      if (!set) {
+        const vec = await api.query.subtensorModule.stakingHotkeys(cold);
+        set = new Set(vec.map((h) => toStr(h)));
+        coldCache.set(cold, set);
+      }
+      if ((!set.has(hot)) && (alphaShare != 0)) {
+        err(`2 StakingHotkeys(${cold}) does not include hotkey ${hot} (present in Alpha with netuid ${n})`);
+      }
+
+      // (3) accumulate
+      const key = `${n}|${hot}`;
+      const prev = sumAlphaByNetHot.get(key) ?? 0;
+      sumAlphaByNetHot.set(key, prev + alphaShare);
+
+      if (!hotPerNet.has(n)) hotPerNet.set(n, new Set());
+      hotPerNet.get(n).add(hot);
+    }
+
+    startKey = pageKeys[pageKeys.length - 1];
+  }
+
+  // For each (n, hot) seen, compare sum Alpha(h,*,n) with TotalHotkeyShares(h,n)
+  for (const [n, hotSet] of hotPerNet.entries()) {
+    const hotList = [...hotSet];
+    const keys = hotList.map((h) => [h, n]);
+    const totals = await api.query.subtensorModule.totalHotkeyShares.multi(keys);
+    for (let i = 0; i < hotList.length; i++) {
+      const h = hotList[i];
+      const expected = sumAlphaByNetHot.get(`${n}|${h}`) ?? 0;
+      const totalHotkeyShares128 = totals[i];
+      const actualTotalHotkeyShares = fixedU64F64ToFloatFromHexString(totalHotkeyShares128.bits);
+      if (!approxEqualAbs(actualTotalHotkeyShares, expected, expected / 1000)) {
+        err(`3 TotalHotkeyShares(${h}, ${n}) != sum Alpha(${h}, *, ${n}) (actual=${actualTotalHotkeyShares} expected=${expected})`);
+      }
+    }
+  }
+
+  return overallOk;
+}
+
+/**
+ * Verify epoch topology constraints:
+ * - BlockAtRegistration exists for all UIDs present in Uids(netuid, *)
+ * - The following vectors have length == SubnetworkN(netuid):
+ *   LastUpdate, ValidatorPermit, Rank, Trust, ValidatorTrust,
+ *   Incentive, Dividends, Active, Emission, Consensus, PruningScores
+ *
+ * Logs every failure with "Constraint error: ..." and returns true iff all pass.
+ */
+export async function checkEpochTopology(api) {
+  const toNum = (x) => (typeof x?.toNumber === "function" ? x.toNumber() : Number(x));
+  let ok = true;
+  const err = (msg) => { console.log(`Constraint error: ${msg}`); ok = false; };
+
+  // 1) get all active netuids
+  let netuids = [];
+  try {
+    netuids = await subnetsAvailable(api); // number[]
+  } catch (e) {
+    err(`failed to get subnetsAvailable: ${e?.message ?? e}`);
+    return false;
+  }
+  if (netuids.length === 0) return true;
+
+  for (const netuid of netuids) {
+    // Subnetwork size N
+    let N = 0;
+    try {
+      N = toNum(await api.query.subtensorModule.subnetworkN(netuid));
+    } catch (e) {
+      err(`failed to read SubnetworkN(${netuid}): ${e?.message ?? e}`);
+      continue;
+    }
+
+    // --- A) BlockAtRegistration must exist for all UIDs in Uids map ---
+
+    // Collect UIDs present in Uids(netuid, *)
+    let uidsEntries = [];
+    try {
+      // Uids is (netuid, hotkey) -> Option<u16>, entries(netuid) gives all present
+      uidsEntries = await api.query.subtensorModule.uids.entries(netuid);
+    } catch (e) {
+      err(`failed to read Uids entries for netuid ${netuid}: ${e?.message ?? e}`);
+      uidsEntries = [];
+    }
+    const uidsPresent = new Set(uidsEntries.map(([_, v]) => {
+      const val = v.unwrap ? v.unwrap() : v;
+      return toNum(val);
+    }));
+
+    // Collect uids that actually have a BlockAtRegistration key
+    let barKeys = [];
+    try {
+      // keys(netuid) returns StorageKey args [netuid, uid]
+      barKeys = await api.query.subtensorModule.blockAtRegistration.keys(netuid);
+    } catch (e) {
+      err(`failed to read BlockAtRegistration keys for netuid ${netuid}: ${e?.message ?? e}`);
+      barKeys = [];
+    }
+    const barUids = new Set(barKeys.map((k) => toNum(k.args[1])));
+
+    // Check coverage
+    for (const uid of uidsPresent) {
+      if (!barUids.has(uid)) {
+        err(`BlockAtRegistration missing for (netuid ${netuid}, uid ${uid})`);
+      }
+    }
+
+    // --- B) Vector maps must have length exactly N ---
+
+    // helpers to fetch a Vec and compare its .length to N
+    const checkLen = async (label, promise) => {
+      try {
+        const vec = await promise; // polkadot.js Vec<...>
+        const len = vec?.length ?? 0;
+        if (len !== N) err(`${label}(${netuid}) length ${len} != SubnetworkN ${N}`);
+      } catch (e) {
+        err(`failed to read ${label}(${netuid}): ${e?.message ?? e}`);
+      }
+    };
+
+    // Note: LastUpdate & Incentive are keyed by NetUidStorageIndex in your pallet,
+    // which polkadot.js typically maps to the same numeric argument usage.
+    await checkLen("LastUpdate",       api.query.subtensorModule.lastUpdate(netuid));
+    await checkLen("ValidatorPermit",  api.query.subtensorModule.validatorPermit(netuid));
+    await checkLen("Rank",             api.query.subtensorModule.rank(netuid));
+    await checkLen("Trust",            api.query.subtensorModule.trust(netuid));
+    await checkLen("ValidatorTrust",   api.query.subtensorModule.validatorTrust(netuid));
+    await checkLen("Incentive",        api.query.subtensorModule.incentive(netuid));
+    await checkLen("Dividends",        api.query.subtensorModule.dividends(netuid));
+    await checkLen("Active",           api.query.subtensorModule.active(netuid));
+    await checkLen("Emission",         api.query.subtensorModule.emission(netuid));
+    await checkLen("Consensus",        api.query.subtensorModule.consensus(netuid));
+    await checkLen("PruningScores",    api.query.subtensorModule.pruningScores(netuid));
+  }
+
+  return ok;
 }
