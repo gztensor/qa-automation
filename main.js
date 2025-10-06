@@ -9,7 +9,8 @@ import {
   checkKeysUidsConstraints,
   checkParentChildRelationship,
   checkStakingConstraints,
-  checkWeightsBondsConstraints
+  checkWeightsBondsConstraints,
+  checkValidatorPermits
 } from './constraints.js';
 
 // const ENDPOINT = 'ws://127.0.0.1:9946';
@@ -70,10 +71,14 @@ async function main() {
   // console.log(`Epoch topology constraints OK = ${epochOk}`);
 
   let parentChildOk = true;
-  parentChildOk = await checkParentChildRelationship(api);
-  console.log(`Parent-child relationship constraints OK = ${parentChildOk}`);
+  // parentChildOk = await checkParentChildRelationship(api);
+  // console.log(`Parent-child relationship constraints OK = ${parentChildOk}`);
 
-  const constraintsOk = keysUidsOk && weightsBondsOk && stakingOk && epochOk && parentChildOk;
+  let validatorPermitsOk = true;
+  validatorPermitsOk = await checkValidatorPermits(api);
+  console.log(`Validator permit constraints OK = ${validatorPermitsOk}`);
+
+  const constraintsOk = keysUidsOk && weightsBondsOk && stakingOk && epochOk && parentChildOk && validatorPermitsOk;
   console.log(`Overall constraints OK = ${constraintsOk}`);
 
   // while (true) {

@@ -841,3 +841,37 @@ export async function checkParentChildRelationship(api) {
   return ok;
 }
 
+/**
+ * Verify: count_true(ValidatorPermit(netuid)) <= MaxAllowedValidators(netuid)
+ * Logs "Constraint error: ..." on any violations and returns overall boolean.
+ */
+export async function checkValidatorPermits(api) {
+  const toNum = (x) => (typeof x?.toNumber === "function" ? x.toNumber() : Number(x));
+  const isTrue = (v) => v === true || v?.isTrue === true;
+
+  let ok = true;
+  const err = (msg) => { console.log(`Constraint error: ${msg}`); ok = false; };
+
+  let netuids = await subnetsAvailable(api); // number[]
+  if (netuids.length === 0) return true;
+
+  for (const netuid of netuids) {
+    try {
+      const permits = await api.query.subtensorModule.validatorPermit(netuid); // Vec<bool>
+      const maxAllowed = toNum(await api.query.subtensorModule.maxAllowedValidators(netuid)); // u16
+
+      const countTrue = permits.reduce((acc, b) => acc + (isTrue(b) ? 1 : 0), 0);
+
+      if (countTrue > maxAllowed) {
+        err(
+          `ValidatorPermit(netuid=${netuid}) has ${countTrue} true flags, ` +
+          `exceeds MaxAllowedValidators=${maxAllowed}`
+        );
+      }
+    } catch (e) {
+      err(`failed to read ValidatorPermit/MaxAllowedValidators for netuid ${netuid}: ${e?.message ?? e}`);
+    }
+  }
+
+  return ok;
+}
