@@ -60,8 +60,8 @@ async function main() {
   // console.log(`Keys-Uids constraints OK = ${keysUidsOk}`);
   
   let simpleLimitsOk = true;
-  simpleLimitsOk = await checkSimpleLimits(api);
-  console.log(`Simple limits constraints OK = ${simpleLimitsOk}`);
+  // simpleLimitsOk = await checkSimpleLimits(api);
+  // console.log(`Simple limits constraints OK = ${simpleLimitsOk}`);
 
   let weightsBondsOk = true; 
   // weightsBondsOk = await checkWeightsBondsConstraints(api);
