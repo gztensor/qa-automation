@@ -73,11 +73,11 @@ export async function checkKeysUidsConstraints(api) {
         list.map(async (h) => [h, await api.query.subtensorModule.owner(h)])
       ); // owners: Array<[hot, owner]>
       const allSame = owners.every(([h, c]) => {
-            if (toStr(c) !== cold) {
-                err(`8.2 Owner() mismatch: OwnedHotkeys(${cold}) contains ${toStr(h)}, but its owner is ${toStr(c)} (netuid ${netuid})`);
-            }
-            return (toStr(c) === cold)
-        });
+        if (toStr(c) !== cold) {
+          err(`8.2 Owner() mismatch: OwnedHotkeys(${cold}) contains ${toStr(h)}, but its owner is ${toStr(c)} (netuid ${netuid})`);
+        }
+        return (toStr(c) === cold)
+      });
       if (!allSame) {
         return false;
       }
@@ -319,6 +319,230 @@ export async function checkStakingConstraints(api) {
       if (!approxEqualAbs(actualTotalHotkeyShares, expected, expected / 1000)) {
         err(`3 TotalHotkeyShares(${h}, ${n}) != sum Alpha(${h}, *, ${n}) (actual=${actualTotalHotkeyShares} expected=${expected})`);
       }
+    }
+  }
+
+  return overallOk;
+}
+
+/**
+ * Check Weights and Bonds storage constraints
+ * 
+ * Validates that the Weights and Bonds double maps maintain proper structure:
+ * 
+ * 10.1 Map Height Constraint: 
+ *      - Number of entries in Weights[netuid_index] <= SubnetworkN[netuid]
+ *      - Number of entries in Bonds[netuid_index] <= SubnetworkN[netuid]
+ * 
+ * 10.2 Valid NetUid Index and UID Keys:
+ *      - All UIDs used as map keys must be in range [0, SubnetworkN-1]
+ * 
+ * 10.3 No Duplicate Target UIDs:
+ *      - Each weights/bonds vector has unique target UIDs (no duplicates)
+ * 
+ * 10.4 Valid Target UID Range:
+ *      - All target UIDs in weight/bond pairs are in range [0, SubnetworkN-1]
+ * 
+ * 10.5 MaxWeightsLimit Constraint:
+ *      - Length of weights vector <= MaxWeightsLimit[netuid]
+ * 
+ * 10.6 Non-negative Values:
+ *      - All weights and bonds are non-negative
+ * 
+ * 10.7 Mechanism Count Bounds:
+ *      - MechanismCountCurrent[netuid] <= MaxMechanismCount
+ * 
+ * These constraints ensure that:
+ * - Weights and bonds only reference valid, existing neurons
+ * - No duplicate or invalid target UIDs exist
+ * - Storage doesn't exceed configured limits
+ * - All values are properly bounded and valid
+ * 
+ * @param {ApiPromise} api - Connected Polkadot API instance
+ * @returns {Promise<boolean>} true if all constraints pass, false otherwise
+ */
+export async function checkWeightsBondsConstraints(api) {
+  // ---------- helpers ----------
+  const toNum = (x) => (typeof x?.toNumber === 'function' ? x.toNumber() : Number(x));
+  const toStr = (x) => (x?.toString ? x.toString() : String(x));
+
+  let overallOk = true;
+  const err = (msg) => { console.log(`Weights/Bonds constraint error: ${msg}`); overallOk = false; };
+
+  // Constants from subtensor/pallets/subtensor/src/subnets/mechanism.rs
+  const GLOBAL_MAX_SUBNET_COUNT = 4096;
+
+  const getMechanismStorageIndex = (netuid, mecid) => {
+    // Formula: storage_index = netuid + sub_id * GLOBAL_MAX_SUBNET_COUNT
+    // This matches the Rust implementation
+    return netuid + (mecid * GLOBAL_MAX_SUBNET_COUNT);
+  };
+
+  const getNetuidFromIndex = (storageIndex) => {
+    return storageIndex % GLOBAL_MAX_SUBNET_COUNT;
+  };
+
+  const getWeightsEntries = async (netuidIndex) => {
+    try {
+      const entries = await api.query.subtensorModule.weights.entries(netuidIndex);
+      return entries.map(([k, v]) => {
+        const uid = toNum(k.args[1]);
+        const weightsVec = v.map((pair) => {
+          // Assuming pair is a tuple [target_uid, weight]
+          const target = toNum(pair[0]);
+          const weight = toNum(pair[1]);
+          return { target, weight };
+        });
+        return { uid, weights: weightsVec };
+      });
+    } catch (e) {
+      err(`failed to read Weights entries for netuid_index ${netuidIndex}: ${e?.message ?? e}`);
+      return [];
+    }
+  };
+
+  const getBondsEntries = async (netuidIndex) => {
+    try {
+      const entries = await api.query.subtensorModule.bonds.entries(netuidIndex);
+      return entries.map(([k, v]) => {
+        const uid = toNum(k.args[1]);
+        const bondsVec = v.map((pair) => {
+          const target = toNum(pair[0]);
+          const bond = toNum(pair[1]);
+          return { target, bond };
+        });
+        return { uid, bonds: bondsVec };
+      });
+    } catch (e) {
+      err(`failed to read Bonds entries for netuid_index ${netuidIndex}: ${e?.message ?? e}`);
+      return [];
+    }
+  };
+
+  // Get all netuids
+  const netuids = await subnetsAvailable(api);
+  if (netuids.length === 0) return true; // nothing to check
+
+  // ---------- per-netuid validation ----------
+  for (const netuid of netuids) {
+    let N = 0, mechanismCount = 1;
+    try {
+      N = toNum(await api.query.subtensorModule.subnetworkN(netuid));
+      // Try to get mechanism count, but if it fails, default to 1
+      try {
+        const mecCount = await api.query.subtensorModule.mechanismCountCurrent(netuid);
+        if (mecCount) {
+          mechanismCount = toNum(mecCount);
+        }
+      } catch (e) {
+        // mechanismCountCurrent might not exist, default to 1
+        mechanismCount = 1;
+      }
+    } catch (e) {
+      err(`failed to read SubnetworkN for netuid ${netuid}: ${e?.message ?? e}`);
+      overallOk = false;
+      continue;
+    }
+
+    // Check constraints for each mechanism in this subnet
+    for (let mecid = 0; mecid < mechanismCount; mecid++) {
+      const netuidIndex = getMechanismStorageIndex(netuid, mecid);
+
+      // Get weights and bonds for this mechanism
+      const weightsEntries = await getWeightsEntries(netuidIndex);
+      const bondsEntries = await getBondsEntries(netuidIndex);
+
+      // 10.1 Map Height Constraint: number of entries <= SubnetworkN
+      if (weightsEntries.length > N) {
+        err(`10.1 Weights[${netuidIndex}] has ${weightsEntries.length} entries, exceeds SubnetworkN=${N} (netuid ${netuid}, mecid ${mecid})`);
+      }
+      if (bondsEntries.length > N) {
+        err(`10.1 Bonds[${netuidIndex}] has ${bondsEntries.length} entries, exceeds SubnetworkN=${N} (netuid ${netuid}, mecid ${mecid})`);
+      }
+
+      // 10.2 Valid UID range for map keys
+      for (const { uid } of weightsEntries) {
+        if (uid < 0 || uid >= N) {
+          err(`10.2 Weights[${netuidIndex}] contains invalid UID ${uid}, expected 0..${N - 1} (netuid ${netuid}, mecid ${mecid})`);
+        }
+      }
+      for (const { uid } of bondsEntries) {
+        if (uid < 0 || uid >= N) {
+          err(`10.2 Bonds[${netuidIndex}] contains invalid UID ${uid}, expected 0..${N - 1} (netuid ${netuid}, mecid ${mecid})`);
+        }
+      }
+
+      // 10.3 Row constraints: No duplicate target UIDs
+      for (const { uid, weights } of weightsEntries) {
+        const targets = weights.map((w) => w.target);
+        const uniqueTargets = new Set(targets);
+        if (targets.length !== uniqueTargets.size) {
+          err(`10.3 Weights[${netuidIndex}][${uid}] has duplicate target UIDs (netuid ${netuid}, mecid ${mecid})`);
+        }
+      }
+      for (const { uid, bonds } of bondsEntries) {
+        const targets = bonds.map((b) => b.target);
+        const uniqueTargets = new Set(targets);
+        if (targets.length !== uniqueTargets.size) {
+          err(`10.3 Bonds[${netuidIndex}][${uid}] has duplicate target UIDs (netuid ${netuid}, mecid ${mecid})`);
+        }
+      }
+
+      // 10.4 Row constraints: Valid target UID range
+      for (const { uid, weights } of weightsEntries) {
+        for (const { target } of weights) {
+          if (target < 0 || target >= N) {
+            err(`10.4 Weights[${netuidIndex}][${uid}] contains invalid target UID ${target}, expected 0..${N - 1} (netuid ${netuid}, mecid ${mecid})`);
+          }
+        }
+      }
+      for (const { uid, bonds } of bondsEntries) {
+        for (const { target } of bonds) {
+          if (target < 0 || target >= N) {
+            err(`10.4 Bonds[${netuidIndex}][${uid}] contains invalid target UID ${target}, expected 0..${N - 1} (netuid ${netuid}, mecid ${mecid})`);
+          }
+        }
+      }
+
+      // 10.5 Check MaxWeightsLimit constraint (if available)
+      try {
+        const maxWeightsLimit = toNum(await api.query.subtensorModule.maxWeightsLimit(netuid));
+        for (const { uid, weights } of weightsEntries) {
+          if (weights.length > maxWeightsLimit) {
+            err(`10.5 Weights[${netuidIndex}][${uid}] has ${weights.length} entries, exceeds MaxWeightsLimit=${maxWeightsLimit} (netuid ${netuid}, mecid ${mecid})`);
+          }
+        }
+      } catch (e) {
+        // MaxWeightsLimit might not be queryable or might not exist
+        // This is not a critical error, so we skip it
+      }
+
+      // 10.6 Weights and bonds should be non-negative (if represented as unsigned, this is implicit)
+      // This check is redundant if the storage type is u16, but we include it for completeness
+      for (const { uid, weights } of weightsEntries) {
+        for (const { weight } of weights) {
+          if (weight < 0) {
+            err(`10.6 Weights[${netuidIndex}][${uid}] contains negative weight ${weight} (netuid ${netuid}, mecid ${mecid})`);
+          }
+        }
+      }
+      for (const { uid, bonds } of bondsEntries) {
+        for (const { bond } of bonds) {
+          if (bond < 0) {
+            err(`10.6 Bonds[${netuidIndex}][${uid}] contains negative bond ${bond} (netuid ${netuid}, mecid ${mecid})`);
+          }
+        }
+      }
+    } // end for each mechanism
+
+    // 10.7 Verify mechanism count is within bounds
+    try {
+      const maxMechanismCount = toNum(await api.query.subtensorModule.maxMechanismCount());
+      if (mechanismCount > maxMechanismCount) {
+        err(`10.7 MechanismCountCurrent[${netuid}]=${mechanismCount} exceeds MaxMechanismCount=${maxMechanismCount}`);
+      }
+    } catch (e) {
+      // MaxMechanismCount might not be queryable
     }
   }
 
