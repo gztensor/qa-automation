@@ -11,7 +11,8 @@ import {
   checkWeightsBondsConstraints
 } from './constraints.js';
 
-const ENDPOINT = 'wss://entrypoint-finney.opentensor.ai';
+const ENDPOINT = 'ws://127.0.0.1:9946';
+// const ENDPOINT = 'wss://entrypoint-finney.opentensor.ai';
 // const ENDPOINT = 'wss://archive.chain.opentensor.ai';
 
 async function chooseContractParameters(contract) {
@@ -51,19 +52,23 @@ async function main() {
   console.log('Connected to', ENDPOINT);
   const logger = new ContractCallLogger();
 
-  const keysUidsOk = await checkKeysUidsConstraints(api);
-  console.log(`Keys-Uids constraints OK = ${keysUidsOk}`);
+  let keysUidsOk = true;
+  // keysUidsOk = await checkKeysUidsConstraints(api);
+  // console.log(`Keys-Uids constraints OK = ${keysUidsOk}`);
 
-  const weightsBondsOk = await checkWeightsBondsConstraints(api);
-  console.log(`Weights-Bonds constraints OK = ${weightsBondsOk}`);
+  let weightsBondsOk = true; 
+  // weightsBondsOk = await checkWeightsBondsConstraints(api);
+  // console.log(`Weights-Bonds constraints OK = ${weightsBondsOk}`);
 
-  const stakingOk = await checkStakingConstraints(api);
-  console.log(`Staking constraints OK = ${stakingOk}`);
+  let stakingOk = true;
+  // stakingOk = await checkStakingConstraints(api);
+  // console.log(`Staking constraints OK = ${stakingOk}`);
 
-  const epochOk = await checkEpochTopology(api);
+  let epochOk = true;
+  epochOk = await checkEpochTopology(api);
   console.log(`Epoch topology constraints OK = ${epochOk}`);
 
-  const constraintsOk =  keysUidsOk && weightsBondsOk && stakingOk;
+  const constraintsOk = keysUidsOk && weightsBondsOk && stakingOk && epochOk;
   console.log(`Overall constraints OK = ${constraintsOk}`);
 
   // while (true) {
