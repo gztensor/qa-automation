@@ -647,3 +647,197 @@ export async function checkEpochTopology(api) {
 
   return ok;
 }
+
+/**
+ * Validate parent/child linkage:
+ *
+ * 1) No cycles (including self-loops) across ChildKeys ∪ ParentKeys ∪ PendingChildKeys (treated as parent → child).
+ * 2) For each (parent, netuid): sum of proportions in ChildKeys(parent, netuid) == SCALE
+ *    and in PendingChildKeys(netuid, parent) == SCALE.
+ * 3) If ChildKeys(parent, netuid) contains child, then ParentKeys(child, netuid) contains parent.
+ * 4) If ParentKeys(child, netuid) contains parent, then ChildKeys(parent, netuid) contains child.
+ *
+ * Returns true iff all constraints hold.
+ */
+export async function checkParentChildRelationship(api) {
+  // 1.0 in runtime's u64 proportion units (u64 max)
+  const SCALE = 18446744073709551615n;
+
+  const toStr = (x) => (x?.toString ? x.toString() : String(x));
+  const toBI  = (x) =>
+    typeof x === "bigint" ? x :
+    x?.toBigInt ? x.toBigInt() :
+    BigInt(x?.toString?.() ?? x);
+
+  let ok = true;
+  const err = (msg) => { console.log(`Constraint error: ${msg}`); ok = false; };
+
+  // Graph for cycle detection (union of all edges)
+  const edgesByNet = new Map(); // Map<number, Map<string, Set<string>>>
+
+  // Separate stores for bidirectional consistency (do NOT mix sources):
+  // Only from ChildKeys:
+  const childrenByParent_fromChildKeys = new Map(); // Map<number, Map<string, Set<string>>>
+  // Only from ParentKeys:
+  const parentsByChild_fromParentKeys  = new Map(); // Map<number, Map<string, Set<string>>>
+
+  const ensure = (map, key, defFactory) => {
+    if (!map.has(key)) map.set(key, defFactory());
+    return map.get(key);
+  };
+
+  const addEdgeToGraph = (n, parentStr, childStr) => {
+    const adj = ensure(edgesByNet, n, () => new Map());
+    if (!adj.has(parentStr)) adj.set(parentStr, new Set());
+    adj.get(parentStr).add(childStr);
+    if (!adj.has(childStr)) adj.set(childStr, new Set()); // ensure node exists
+  };
+
+  // ---- A) ChildKeys: (parent, netuid) -> Vec<(u64 proportion, child)>
+  try {
+    const entries = await api.query.subtensorModule.childKeys.entries();
+    for (const [k, vec] of entries) {
+      const parent = toStr(k.args[0]);
+      const netuid = k.args[1].toNumber();
+
+      // proportion sum check
+      let sum = 0n;
+
+      // record children (for consistency 3) and add edges to graph
+      const byP = ensure(childrenByParent_fromChildKeys, netuid, () => new Map());
+      if (!byP.has(parent)) byP.set(parent, new Set());
+      const childSet = byP.get(parent);
+
+      for (const tuple of vec) {
+        const proportion = toBI(tuple[0]);
+        const child = toStr(tuple[1]);
+        sum += proportion;
+
+        childSet.add(child);
+        addEdgeToGraph(netuid, parent, child);
+      }
+
+      if (sum !== SCALE) {
+        err(`2 ChildKeys sum != 1.0 for (parent=${parent}, netuid=${netuid}); sumRaw=${sum}, expected=${SCALE}`);
+      }
+    }
+  } catch (e) {
+    err(`failed to read ChildKeys entries: ${e?.message ?? e}`);
+  }
+
+  // ---- B) PendingChildKeys: (netuid, parent) -> (Vec<(u64, child)>, u64)
+  // (Included in cycle detection and proportion sum; not part of bidirectional consistency rules.)
+  try {
+    const entries = await api.query.subtensorModule.pendingChildKeys.entries();
+    for (const [k, v] of entries) {
+      const netuid = k.args[0].toNumber();
+      const parent = toStr(k.args[1]);
+
+      const tuples = v[0]; // Vec<(u64, AccountId)>
+      let sum = 0n;
+
+      for (const tuple of tuples) {
+        const proportion = toBI(tuple[0]);
+        const child = toStr(tuple[1]);
+        sum += proportion;
+
+        addEdgeToGraph(netuid, parent, child);
+      }
+
+      if (sum !== SCALE) {
+        err(`2 PendingChildKeys sum != 1.0 for (parent=${parent}, netuid=${netuid}); sumRaw=${sum}, expected=${SCALE}`);
+      }
+    }
+  } catch (e) {
+    err(`failed to read PendingChildKeys entries: ${e?.message ?? e}`);
+  }
+
+  // ---- C) ParentKeys: (child, netuid) -> Vec<(u64, parent)>
+  try {
+    const entries = await api.query.subtensorModule.parentKeys.entries();
+    for (const [k, vec] of entries) {
+      const child  = toStr(k.args[0]);
+      const netuid = k.args[1].toNumber();
+
+      // record parents (for consistency 4) and add edges to graph as parent->child
+      const byC = ensure(parentsByChild_fromParentKeys, netuid, () => new Map());
+      if (!byC.has(child)) byC.set(child, new Set());
+      const parentSet = byC.get(child);
+
+      for (const tuple of vec) {
+        const parent = toStr(tuple[1]);
+        parentSet.add(parent);
+        addEdgeToGraph(netuid, parent, child);
+      }
+    }
+  } catch (e) {
+    err(`failed to read ParentKeys entries: ${e?.message ?? e}`);
+  }
+
+  // ---- 1) Cycle detection per netuid (includes self-loops) ----
+  for (const [netuid, adj] of edgesByNet.entries()) {
+    const WHITE = 0, GRAY = 1, BLACK = 2;
+    const color = new Map();
+    for (const node of adj.keys()) color.set(node, WHITE);
+
+    const stack = [];
+    const dfs = (u) => {
+      color.set(u, GRAY);
+      stack.push(u);
+
+      // self-loop
+      if (adj.get(u)?.has(u)) {
+        err(`1 cycle detected (self-loop) at ${u} on netuid ${netuid}`);
+      }
+
+      for (const v of adj.get(u) ?? []) {
+        const col = color.get(v) ?? WHITE;
+        if (col === WHITE) {
+          dfs(v);
+        } else if (col === GRAY) {
+          const idx = stack.indexOf(v);
+          const cycle = idx >= 0 ? stack.slice(idx).concat(v) : [v, u, v];
+          err(`1 cycle detected on netuid ${netuid}: ${cycle.join(' -> ')}`);
+        }
+      }
+
+      stack.pop();
+      color.set(u, BLACK);
+    };
+
+    for (const u of adj.keys()) {
+      if ((color.get(u) ?? WHITE) === WHITE) dfs(u);
+    }
+  }
+
+  // ---- 3) ChildKeys ⟶ ParentKeys (including self-loops) ----
+  for (const [netuid, byP] of childrenByParent_fromChildKeys.entries()) {
+    const byC = parentsByChild_fromParentKeys.get(netuid) ?? new Map();
+    for (const [parent, children] of byP.entries()) {
+      for (const child of children) {
+        const parentsSet = byC.get(child) ?? new Set();
+        if (!parentsSet.has(parent)) {
+          err(`3 ParentKeys(child=${child}, netuid=${netuid}) does not contain parent ${parent}, `
+            + `but ChildKeys(parent=${parent}, netuid=${netuid}) contains child`);
+        }
+      }
+    }
+  }
+
+  // ---- 4) ParentKeys ⟶ ChildKeys (including self-loops) ----
+  for (const [netuid, byC] of parentsByChild_fromParentKeys.entries()) {
+    const byP = childrenByParent_fromChildKeys.get(netuid) ?? new Map();
+    for (const [child, parents] of byC.entries()) {
+      for (const parent of parents) {
+        const childrenSet = byP.get(parent) ?? new Set();
+        if (!childrenSet.has(child)) {
+          err(`4 ChildKeys(parent=${parent}, netuid=${netuid}) does not contain child ${child}, `
+            + `but ParentKeys(child=${child}, netuid=${netuid}) contains parent`);
+        }
+      }
+    }
+  }
+
+  return ok;
+}
+
