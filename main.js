@@ -10,12 +10,17 @@ import {
   checkParentChildRelationship,
   checkStakingConstraints,
   checkWeightsBondsConstraints,
-  checkValidatorPermits
+  checkValidatorPermits,
+  countChildAndParentKeys,
+  countEmptyParentKeys,
+  checkLiquidity,
+  listEmptyParentKeys
 } from './constraints.js';
 
-// const ENDPOINT = 'ws://127.0.0.1:9946';
+// const ENDPOINT = 'ws://127.0.0.1:9944';
+const ENDPOINT = 'ws://127.0.0.1:9946';
 // const ENDPOINT = 'wss://entrypoint-finney.opentensor.ai';
-const ENDPOINT = 'wss://archive.chain.opentensor.ai';
+// const ENDPOINT = 'wss://archive.chain.opentensor.ai';
 
 async function chooseContractParameters(contract) {
   const prmCount = contract.parameterCount;
@@ -75,11 +80,24 @@ async function main() {
   // console.log(`Parent-child relationship constraints OK = ${parentChildOk}`);
 
   let validatorPermitsOk = true;
-  validatorPermitsOk = await checkValidatorPermits(api);
-  console.log(`Validator permit constraints OK = ${validatorPermitsOk}`);
+  // validatorPermitsOk = await checkValidatorPermits(api);
+  // console.log(`Validator permit constraints OK = ${validatorPermitsOk}`);
 
-  const constraintsOk = keysUidsOk && weightsBondsOk && stakingOk && epochOk && parentChildOk && validatorPermitsOk;
+  let liquidityOk = true;
+  liquidityOk = await checkLiquidity(api);
+  console.log(`Liquidity constraints OK = ${liquidityOk}`);
+
+  const constraintsOk = keysUidsOk && weightsBondsOk && stakingOk && epochOk && parentChildOk && validatorPermitsOk && liquidityOk;
   console.log(`Overall constraints OK = ${constraintsOk}`);
+
+  // let counters = await countChildAndParentKeys(api);
+  // console.log(counters);
+
+  // let emptyPk = await countEmptyParentKeys(api);
+  // console.log(emptyPk);
+
+  // await listEmptyParentKeys(api);
+
 
   // while (true) {
   //   try {

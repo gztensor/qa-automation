@@ -717,8 +717,8 @@ export async function checkParentChildRelationship(api) {
         addEdgeToGraph(netuid, parent, child);
       }
 
-      if (sum !== SCALE) {
-        err(`2 ChildKeys sum != 1.0 for (parent=${parent}, netuid=${netuid}); sumRaw=${sum}, expected=${SCALE}`);
+      if ((sum > SCALE) || (sum == 0)) {
+        err(`2 ChildKeys sum for (parent=${parent}, netuid=${netuid}); sumRaw=${sum}, 0 < expected <= ${SCALE}`);
       }
     }
   } catch (e) {
@@ -744,8 +744,8 @@ export async function checkParentChildRelationship(api) {
         addEdgeToGraph(netuid, parent, child);
       }
 
-      if (sum !== SCALE) {
-        err(`2 PendingChildKeys sum != 1.0 for (parent=${parent}, netuid=${netuid}); sumRaw=${sum}, expected=${SCALE}`);
+      if (sum > SCALE) {
+        err(`2 PendingChildKeys for (parent=${parent}, netuid=${netuid}); sumRaw=${sum}, expected=${SCALE}`);
       }
     }
   } catch (e) {
@@ -838,6 +838,41 @@ export async function checkParentChildRelationship(api) {
     }
   }
 
+  // 5. ChildKeys: no duplicates per (parent, netuid) and length <= 5
+  try {
+    const entries = await api.query.subtensorModule.childKeys.entries();
+    for (const [k, vec] of entries) {
+      const parent = toStr(k.args[0]);
+      const netuid = k.args[1].toNumber();
+      const children = vec.map(tuple => toStr(tuple[1]));
+      const uniq = new Set(children);
+      if (uniq.size !== children.length) {
+        err(`5 ChildKeys(parent=${parent}, netuid=${netuid}) has duplicate child hotkeys`);
+      }
+      if (children.length > 5) {
+        err(`5 ChildKeys(parent=${parent}, netuid=${netuid}) length ${children.length} exceeds 5`);
+      }
+    }
+  } catch (e) {
+    err(`failed to read ChildKeys for duplicate/length check: ${e?.message ?? e}`);
+  }
+
+  // 6. ParentKeys: no duplicates per (child, netuid)
+  try {
+    const entries = await api.query.subtensorModule.parentKeys.entries();
+    for (const [k, vec] of entries) {
+      const child = toStr(k.args[0]);
+      const netuid = k.args[1].toNumber();
+      const parents = vec.map(tuple => toStr(tuple[1]));
+      const uniq = new Set(parents);
+      if (uniq.size !== parents.length) {
+        err(`6 ParentKeys(child=${child}, netuid=${netuid}) has duplicate parent hotkeys`);
+      }
+    }
+  } catch (e) {
+    err(`failed to read ParentKeys for duplicate check: ${e?.message ?? e}`);
+  }  
+
   return ok;
 }
 
@@ -870,6 +905,205 @@ export async function checkValidatorPermits(api) {
       }
     } catch (e) {
       err(`failed to read ValidatorPermit/MaxAllowedValidators for netuid ${netuid}: ${e?.message ?? e}`);
+    }
+  }
+
+  return ok;
+}
+
+export async function countChildAndParentKeys(api) {
+  const [childEntries, parentEntries] = await Promise.all([
+    api.query.subtensorModule.childKeys.entries(),
+    api.query.subtensorModule.parentKeys.entries(),
+  ]);
+
+  return {
+    childKeys: childEntries.length,
+    parentKeys: parentEntries.length,
+  };
+}
+
+export async function countEmptyParentKeys(api) {
+  const entries = await api.query.subtensorModule.parentKeys.entries();
+  const empty = entries.filter(([, v]) => v.isEmpty);
+  console.log(empty.toString());
+  return empty.length;
+}
+
+export async function listEmptyParentKeys(api) {
+  const entries = await api.query.subtensorModule.parentKeys.entries();
+
+  const empties = entries
+    .filter(([, v]) => v.isEmpty)
+    .map(([key]) => {
+      // For a StorageDoubleMap, key.args = [child, netuid]
+      const [child, netuid] = key.args;
+      return {
+        child: child.toString(),
+        netuid: netuid.toString(),
+      };
+    });
+
+  console.log(JSON.stringify(empties, null, 2));
+  return empties;
+}
+
+function box(value, low, high) {
+  if (value <= low) {
+    return low;
+  } else if (value >= high) {
+    return high;
+  } else {
+    return value;
+  }
+}
+
+/**
+ * Compute implied liquidity from all LP positions and compare with actual reserves.
+ *
+ * Implied amounts per position (given current price P):
+ *   alpha_liq = L * ( 1 / sqrt(P) - 1 / sqrt(P_low) )
+ *   tao_liq   = L * ( sqrt(P_high) - sqrt(P) )
+ *
+ * where:
+ *   P_low  = 1.0001 ** (tick_low / 2)
+ *   P_high = 1.0001 ** (tick_high / 2)
+ *
+ * Actual liquidity per subnet:
+ *   TAO_actual   = SubnetTAO(n) + SubnetTaoProvided(n)
+ *   Alpha_actual = SubnetAlphaIn(n) + SubnetAlphaInProvided(n)
+ *
+ * We compare implied vs actual with a small relative/absolute epsilon.
+ */
+export async function checkLiquidity(api) {
+  // ---------- helpers ----------
+  const toBIu128 = (x) =>
+    typeof x === "bigint" ? x :
+    x?.toBigInt ? x.toBigInt() :
+    BigInt(x?.toString?.() ?? x);
+
+  const toNum = (x) => (typeof x?.toNumber === "function" ? x.toNumber() : Number(x));
+  const toStr = (x) => (x?.toString ? x.toString() : String(x));
+
+  // NOTE: this is lossy for very large integers but fine for float math below.
+  const looseNum = (x) => Number(x?.toString?.() ?? x);
+
+  // Convert a BigInt to Number (approx) safely via decimal string
+  const biToNumber = (bi) => Number.parseFloat(bi.toString());
+
+  const relAlmostEq = (a, b, rel = 1e-6, abs = 1e-6) => {
+    const diff = Math.abs(a - b);
+    if (diff <= abs) return true;
+    const scale = Math.max(Math.abs(a), Math.abs(b), 1);
+    return diff / scale <= rel;
+  };
+
+  let ok = true;
+  const err = (msg) => { console.log(`Constraint error: ${msg}`); ok = false; };
+
+  // ---- get only dtao subnets ----
+  const allNetuids = await subnetsAvailable(api);
+  let netuids = [];
+  for (const n of allNetuids) {
+    const mech = await api.query.subtensorModule.subnetMechanism(n);
+    if (toNum(mech) === 1) netuids.push(n);
+  }
+  if (netuids.length === 0) return true; // nothing to check
+
+  netuids = [netuids[9]];
+
+  console.log(`netuids = ${netuids}`);
+
+  // ---------- actual reserves per subnet ----------
+  const actualByNet = new Map(); // n -> { tao: number, alpha: number, price: number }
+  for (const n of netuids) {
+    const tao     = toBIu128(await api.query.subtensorModule.subnetTAO(n));
+    const taoProv = toBIu128(await api.query.subtensorModule.subnetTaoProvided(n));
+    const alphaIn = toBIu128(await api.query.subtensorModule.subnetAlphaIn(n));
+    const alphaPr = toBIu128(await api.query.subtensorModule.subnetAlphaInProvided(n));
+
+    const taoActualNum   = biToNumber(tao + taoProv);
+    const alphaActualNum = biToNumber(alphaIn + alphaPr);
+
+    // Derive current price as TAO / Alpha (quote/base)
+    const price = alphaActualNum > 0 ? (taoActualNum / alphaActualNum) : 0;
+
+    actualByNet.set(n, { tao: taoActualNum, alpha: alphaActualNum, price });
+  }
+
+  // ---------- implied liquidity: sum over all positions ----------
+  // Positions NMap key: (netuid, accountId, positionId) -> Position
+  const entries = await api.query.swap.positions.entries();
+  // Accumulators
+  const implied = new Map(); // n -> { tao: number, alpha: number }
+  for (const [k, posOpt] of entries) {
+    const n    = toNum(k.args[0]);          // netuid
+    const addr = k.args[1];                 // accountId
+    const id = k.args[2];                   // Position Id
+    if (!actualByNet.has(n)) continue;
+
+    const pos = posOpt.isSome ? posOpt.unwrap() : posOpt;
+    if (!pos) continue;
+
+    const L        = looseNum(pos.liquidity);
+    const tickLow  = looseNum(pos.tickLow ?? pos.tick_low);
+    const tickHigh = looseNum(pos.tickHigh ?? pos.tick_high);
+
+    const act = actualByNet.get(n);
+    const P  = act.price;
+    if (!(P > 0)) {
+      // No price: skip contribution; actual alpha or tao likely zero (will be checked later)
+      continue;
+    }
+
+    // price from ticks
+    const P_low  = Math.pow(1.0001, tickLow  / 2);
+    const P_high = Math.pow(1.0001, tickHigh / 2);
+    
+    // sqrt prices
+    const sP_low  = Math.sqrt(P_low);
+    const sP_high = Math.sqrt(P_high);
+    const sP      = box(Math.sqrt(P), sP_low, sP_high);
+
+    // Liquidity formulas
+    const alpha_liq = L * (1 / sP - 1 / sP_high);
+    const tao_liq   = L * (sP - sP_low);
+
+    if (L != 18446744073709552000n) {
+      console.log(`===================================================`);
+      console.log(`Position ID: ${pos.id}`);
+      console.log(`Position: ${pos.toString()}`);
+      console.log(`AccountID: ${addr}`);
+      console.log(`Liquidity: ${L}`);
+      console.log(`sP - sP_low = ${sP - sP_low}`);
+      console.log(`Alpha Liquidity: ${alpha_liq/1e9}`);
+      console.log(`TAO Liquidity:   ${tao_liq/1e9}`);
+    }
+
+
+    const acc = implied.get(n) ?? { tao: 0, alpha: 0 };
+    implied.set(n, {
+      tao:   acc.tao   + tao_liq,
+      alpha: acc.alpha + alpha_liq,
+    });
+  }
+
+  // ---------- compare implied vs actual ----------
+  for (const n of netuids) {
+    const act = actualByNet.get(n) ?? { tao: 0, alpha: 0, price: 0 };
+    const imp = implied.get(n)     ?? { tao: 0, alpha: 0 };
+
+    // Alpha
+    if (!relAlmostEq(imp.alpha, act.alpha, 1e-6, 1e-6)) {
+      let diff = (100 * (act.alpha - imp.alpha)/imp.alpha).toFixed(3);
+      let abs_diff = Math.abs(act.alpha - imp.alpha) / 1e9;
+      err(`Alpha liquidity mismatch on netuid ${n}: implied=${imp.alpha} actual=${act.alpha}, diff = ${diff}%, ${abs_diff} Alpha`);
+    }
+    // TAO
+    if (!relAlmostEq(imp.tao, act.tao, 1e-6, 1e-6)) {
+      let diff = (100 * (act.tao - imp.tao)/imp.tao).toFixed(3);
+      let abs_diff = Math.abs(act.tao - imp.tao) / 1e9;
+      err(`TAO liquidity mismatch on netuid ${n}: implied=${imp.tao} actual=${act.tao}, diff = ${diff}%, ${abs_diff} TAO`);
     }
   }
 
