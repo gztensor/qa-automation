@@ -11,10 +11,14 @@ import {
   checkStakingConstraints,
   checkWeightsBondsConstraints,
   checkValidatorPermits,
+<<<<<<< HEAD
   countChildAndParentKeys,
   countEmptyParentKeys,
   checkLiquidity,
   listEmptyParentKeys
+=======
+  checkSimpleLimits
+>>>>>>> f2892ea345c3593ad10c5ccd42d3353151fee3fa
 } from './constraints.js';
 
 // const ENDPOINT = 'ws://127.0.0.1:9944';
@@ -62,6 +66,10 @@ async function main() {
   let keysUidsOk = true;
   // keysUidsOk = await checkKeysUidsConstraints(api);
   // console.log(`Keys-Uids constraints OK = ${keysUidsOk}`);
+  
+  let simpleLimitsOk = true;
+  // simpleLimitsOk = await checkSimpleLimits(api);
+  // console.log(`Simple limits constraints OK = ${simpleLimitsOk}`);
 
   let weightsBondsOk = true; 
   // weightsBondsOk = await checkWeightsBondsConstraints(api);
@@ -87,7 +95,7 @@ async function main() {
   liquidityOk = await checkLiquidity(api);
   console.log(`Liquidity constraints OK = ${liquidityOk}`);
 
-  const constraintsOk = keysUidsOk && weightsBondsOk && stakingOk && epochOk && parentChildOk && validatorPermitsOk && liquidityOk;
+  const constraintsOk = keysUidsOk && simpleLimitsOk && weightsBondsOk && stakingOk && epochOk && parentChildOk && validatorPermitsOk && liquidityOk;
   console.log(`Overall constraints OK = ${constraintsOk}`);
 
   // let counters = await countChildAndParentKeys(api);
