@@ -976,6 +976,8 @@ function box(value, low, high) {
  * We compare implied vs actual with a small relative/absolute epsilon.
  */
 export async function checkLiquidity(api) {
+  let total_abs_tao_diff = 0;
+
   // ---------- helpers ----------
   const toBIu128 = (x) =>
     typeof x === "bigint" ? x :
@@ -991,9 +993,8 @@ export async function checkLiquidity(api) {
   // Convert a BigInt to Number (approx) safely via decimal string
   const biToNumber = (bi) => Number.parseFloat(bi.toString());
 
-  const relAlmostEq = (a, b, rel = 1e-6, abs = 1e-6) => {
+  const relAlmostEq = (a, b, rel = 1e-6) => {
     const diff = Math.abs(a - b);
-    if (diff <= abs) return true;
     const scale = Math.max(Math.abs(a), Math.abs(b), 1);
     return diff / scale <= rel;
   };
@@ -1010,7 +1011,7 @@ export async function checkLiquidity(api) {
   }
   if (netuids.length === 0) return true; // nothing to check
 
-  netuids = [netuids[9]];
+  // netuids = [netuids[98]];
 
   console.log(`netuids = ${netuids}`);
 
@@ -1033,7 +1034,7 @@ export async function checkLiquidity(api) {
     const price = priceSqrt * priceSqrt;
 
     // Expect price to match derived price at least very approximately
-    if (!relAlmostEq(price, priceDerived, 0.1, 1000)) {
+    if (!relAlmostEq(price, priceDerived, 0.1)) {
       err(`SN ${n} price ${price} doesn't match derived price ${priceDerived}`);
     }
 
@@ -1099,18 +1100,21 @@ export async function checkLiquidity(api) {
     const imp = implied.get(n)     ?? { tao: 0, alpha: 0 };
 
     // Alpha
-    if (!relAlmostEq(imp.alpha, act.alpha, 1e-6, 1e-6)) {
+    if (!relAlmostEq(imp.alpha, act.alpha, 1e-6)) {
       let diff = (100 * (act.alpha - imp.alpha)/imp.alpha).toFixed(3);
       let abs_diff = Math.abs(act.alpha - imp.alpha) / 1e9;
       err(`Alpha liquidity mismatch on netuid ${n}: implied=${imp.alpha} actual=${act.alpha}, diff = ${diff}%, ${abs_diff} Alpha`);
     }
     // TAO
-    if (!relAlmostEq(imp.tao, act.tao, 1e-6, 1e-6)) {
+    if (!relAlmostEq(imp.tao, act.tao, 1e-6)) {
       let diff = (100 * (act.tao - imp.tao)/imp.tao).toFixed(3);
       let abs_diff = Math.abs(act.tao - imp.tao) / 1e9;
+      total_abs_tao_diff += abs_diff;
       err(`TAO liquidity mismatch on netuid ${n}: implied=${imp.tao} actual=${act.tao}, diff = ${diff}%, ${abs_diff} TAO`);
     }
   }
+
+  console.log(`total_abs_tao_diff = ${total_abs_tao_diff}`);
 
   return ok;
 }
