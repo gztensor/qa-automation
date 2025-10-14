@@ -1025,8 +1025,17 @@ export async function checkLiquidity(api) {
     const taoActualNum   = biToNumber(tao + taoProv);
     const alphaActualNum = biToNumber(alphaIn + alphaPr);
 
-    // Derive current price as TAO / Alpha (quote/base)
-    const price = alphaActualNum > 0 ? (taoActualNum / alphaActualNum) : 0;
+    // Current price
+    const priceDerived = alphaActualNum > 0 ? (taoActualNum / alphaActualNum) : 0;
+
+    const priceSqrtU64F64 = await api.query.swap.alphaSqrtPrice(n);
+    const priceSqrt = fixedU64F64ToFloatFromHexString(priceSqrtU64F64.bits);
+    const price = priceSqrt * priceSqrt;
+
+    // Expect price to match derived price at least very approximately
+    if (!relAlmostEq(price, priceDerived, 0.1, 1000)) {
+      err(`SN ${n} price ${price} doesn't match derived price ${priceDerived}`);
+    }
 
     actualByNet.set(n, { tao: taoActualNum, alpha: alphaActualNum, price });
   }
@@ -1057,29 +1066,25 @@ export async function checkLiquidity(api) {
     }
 
     // price from ticks
-    const P_low  = Math.pow(1.0001, tickLow  / 2);
-    const P_high = Math.pow(1.0001, tickHigh / 2);
+    const price_low_sqrt  = Math.pow(1.0001, tickLow  / 2);
+    const price_high_sqrt = Math.pow(1.0001, tickHigh / 2);
     
     // sqrt prices
-    const sP_low  = Math.sqrt(P_low);
-    const sP_high = Math.sqrt(P_high);
-    const sP      = box(Math.sqrt(P), sP_low, sP_high);
+    const price_sqrt      = box(Math.sqrt(P), price_low_sqrt, price_high_sqrt);
 
     // Liquidity formulas
-    const alpha_liq = L * (1 / sP - 1 / sP_high);
-    const tao_liq   = L * (sP - sP_low);
+    const alpha_liq = L * (1 / price_sqrt - 1 / price_high_sqrt);
+    const tao_liq   = L * (price_sqrt - price_low_sqrt);
 
-    if (L != 18446744073709552000n) {
-      console.log(`===================================================`);
-      console.log(`Position ID: ${pos.id}`);
-      console.log(`Position: ${pos.toString()}`);
-      console.log(`AccountID: ${addr}`);
-      console.log(`Liquidity: ${L}`);
-      console.log(`sP - sP_low = ${sP - sP_low}`);
-      console.log(`Alpha Liquidity: ${alpha_liq/1e9}`);
-      console.log(`TAO Liquidity:   ${tao_liq/1e9}`);
-    }
-
+    // if (L != 18446744073709552000n) {
+    //   console.log(`===================================================`);
+    //   console.log(`Position ID: ${pos.id}`);
+    //   console.log(`Position: ${pos.toString()}`);
+    //   console.log(`AccountID: ${addr}`);
+    //   console.log(`Liquidity: ${L}`);
+    //   console.log(`Alpha Liquidity: ${alpha_liq/1e9}`);
+    //   console.log(`TAO Liquidity:   ${tao_liq/1e9}`);
+    // }
 
     const acc = implied.get(n) ?? { tao: 0, alpha: 0 };
     implied.set(n, {

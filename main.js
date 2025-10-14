@@ -11,14 +11,11 @@ import {
   checkStakingConstraints,
   checkWeightsBondsConstraints,
   checkValidatorPermits,
-<<<<<<< HEAD
   countChildAndParentKeys,
   countEmptyParentKeys,
   checkLiquidity,
-  listEmptyParentKeys
-=======
+  listEmptyParentKeys,
   checkSimpleLimits
->>>>>>> f2892ea345c3593ad10c5ccd42d3353151fee3fa
 } from './constraints.js';
 
 // const ENDPOINT = 'ws://127.0.0.1:9944';
