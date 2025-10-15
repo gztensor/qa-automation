@@ -11,6 +11,7 @@
     "@polkadot/keyring": "12.2.1",
     "@polkadot/util": "^13.0.2",
     "@polkadot/util-crypto": "^13.0.2",
+    "bignumber.js": "^9.3.1",
     "dotenv": "^17.2.3",
     "fs": "^0.0.1-security",
     "globby": "^15.0.0",

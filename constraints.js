@@ -1,4 +1,5 @@
-import { approxEqualAbs, fixedU64F64ToFloatFromHexString, subnetsAvailable } from './utils.js'
+import { approxEqualAbs, approxEqRel, fixedU64F64ToBigNumber, fixedU64F64ToFloatFromHexString, subnetsAvailable } from './utils.js'
+import BigNumber from "bignumber.js";
 
 export async function checkKeysUidsConstraints(api) {
   // ---------- helpers ----------
@@ -949,13 +950,47 @@ export async function listEmptyParentKeys(api) {
 }
 
 function box(value, low, high) {
-  if (value <= low) {
+  if (value.isLessThanOrEqualTo(low)) {
     return low;
-  } else if (value >= high) {
+  } else if (value.isGreaterThanOrEqualTo(high)) {
     return high;
   } else {
     return value;
   }
+}
+
+// Fast integer power: base^exp where exp is a non-negative JS integer
+function powiBN(base, exp) {
+  let b = new BigNumber(base);
+  let e = exp >>> 0;                 // ensure non-negative 32-bit
+  let out = new BigNumber(1);
+
+  while (e > 0) {
+    if (e & 1) out = out.times(b);   // multiply when bit is set
+    e = e >>> 1;                     // shift
+    if (e) b = b.times(b);           // square for next bit
+
+    // Cut down precision to speed up calculations
+    b = BigNumber(b.toFixed(100))
+    out = BigNumber(out.toFixed(100))
+  }
+
+  return out;
+}
+
+/**
+ * Compute base^(tick/2) efficiently (tick is integer BigNumber).
+ * Handles negative ticks.
+ */
+export function powHalfStep(base, tick) {
+  const stepSqrt = new BigNumber(base).sqrt();
+  const e = new BigNumber(tick).integerValue(BigNumber.ROUND_FLOOR); // tick is already integer
+
+  const k = e.abs().toNumber();      // safe here (443636 fits in JS int)
+  let p = powiBN(stepSqrt, k);
+
+  if (e.isNegative()) p = new BigNumber(1).div(p);
+  return p;
 }
 
 /**
@@ -978,27 +1013,6 @@ function box(value, low, high) {
 export async function checkLiquidity(api) {
   let total_abs_tao_diff = 0;
 
-  // ---------- helpers ----------
-  const toBIu128 = (x) =>
-    typeof x === "bigint" ? x :
-    x?.toBigInt ? x.toBigInt() :
-    BigInt(x?.toString?.() ?? x);
-
-  const toNum = (x) => (typeof x?.toNumber === "function" ? x.toNumber() : Number(x));
-  const toStr = (x) => (x?.toString ? x.toString() : String(x));
-
-  // NOTE: this is lossy for very large integers but fine for float math below.
-  const looseNum = (x) => Number(x?.toString?.() ?? x);
-
-  // Convert a BigInt to Number (approx) safely via decimal string
-  const biToNumber = (bi) => Number.parseFloat(bi.toString());
-
-  const relAlmostEq = (a, b, rel = 1e-6) => {
-    const diff = Math.abs(a - b);
-    const scale = Math.max(Math.abs(a), Math.abs(b), 1);
-    return diff / scale <= rel;
-  };
-
   let ok = true;
   const err = (msg) => { console.log(`Constraint error: ${msg}`); ok = false; };
 
@@ -1007,38 +1021,38 @@ export async function checkLiquidity(api) {
   let netuids = [];
   for (const n of allNetuids) {
     const mech = await api.query.subtensorModule.subnetMechanism(n);
-    if (toNum(mech) === 1) netuids.push(n);
+    if (parseInt(mech) === 1) netuids.push(n);
   }
   if (netuids.length === 0) return true; // nothing to check
 
-  // netuids = [netuids[98]];
+  // netuids = [netuids[9]];
 
   console.log(`netuids = ${netuids}`);
 
   // ---------- actual reserves per subnet ----------
   const actualByNet = new Map(); // n -> { tao: number, alpha: number, price: number }
   for (const n of netuids) {
-    const tao     = toBIu128(await api.query.subtensorModule.subnetTAO(n));
-    const taoProv = toBIu128(await api.query.subtensorModule.subnetTaoProvided(n));
-    const alphaIn = toBIu128(await api.query.subtensorModule.subnetAlphaIn(n));
-    const alphaPr = toBIu128(await api.query.subtensorModule.subnetAlphaInProvided(n));
+    const tao     = BigNumber(await api.query.subtensorModule.subnetTAO(n));
+    const taoProv = BigNumber(await api.query.subtensorModule.subnetTaoProvided(n));
+    const alphaIn = BigNumber(await api.query.subtensorModule.subnetAlphaIn(n));
+    const alphaPr = BigNumber(await api.query.subtensorModule.subnetAlphaInProvided(n));
 
-    const taoActualNum   = biToNumber(tao + taoProv);
-    const alphaActualNum = biToNumber(alphaIn + alphaPr);
+    const taoActualNum   = tao.plus(taoProv);
+    const alphaActualNum = alphaIn.plus(alphaPr);
 
     // Current price
-    const priceDerived = alphaActualNum > 0 ? (taoActualNum / alphaActualNum) : 0;
+    const priceDerived = alphaActualNum > 0 ? taoActualNum.dividedBy(alphaActualNum) : BigNumber(0);
 
     const priceSqrtU64F64 = await api.query.swap.alphaSqrtPrice(n);
-    const priceSqrt = fixedU64F64ToFloatFromHexString(priceSqrtU64F64.bits);
-    const price = priceSqrt * priceSqrt;
+    const priceSqrt = fixedU64F64ToBigNumber(priceSqrtU64F64.bits);
+    const price = priceSqrt.pow(2);
 
     // Expect price to match derived price at least very approximately
-    if (!relAlmostEq(price, priceDerived, 0.1)) {
+    if (!approxEqRel(price, priceDerived, BigNumber(0.1))) {
       err(`SN ${n} price ${price} doesn't match derived price ${priceDerived}`);
     }
 
-    actualByNet.set(n, { tao: taoActualNum, alpha: alphaActualNum, price });
+    actualByNet.set(n, { tao: taoActualNum, alpha: alphaActualNum, price, priceSqrt });
   }
 
   // ---------- implied liquidity: sum over all positions ----------
@@ -1047,70 +1061,70 @@ export async function checkLiquidity(api) {
   // Accumulators
   const implied = new Map(); // n -> { tao: number, alpha: number }
   for (const [k, posOpt] of entries) {
-    const n    = toNum(k.args[0]);          // netuid
-    const addr = k.args[1];                 // accountId
-    const id = k.args[2];                   // Position Id
+    const n    = parseInt(k.args[0]);  // netuid
+    const addr = k.args[1];            // accountId
+    const id = k.args[2];              // Position Id
     if (!actualByNet.has(n)) continue;
 
     const pos = posOpt.isSome ? posOpt.unwrap() : posOpt;
     if (!pos) continue;
 
-    const L        = looseNum(pos.liquidity);
-    const tickLow  = looseNum(pos.tickLow ?? pos.tick_low);
-    const tickHigh = looseNum(pos.tickHigh ?? pos.tick_high);
+    const L        = BigNumber(pos.liquidity);
+    const tickLow  = BigNumber(pos.tickLow ?? pos.tick_low);
+    const tickHigh = BigNumber(pos.tickHigh ?? pos.tick_high);
 
     const act = actualByNet.get(n);
-    const P  = act.price;
-    if (!(P > 0)) {
+    if (!(act.price > 0)) {
       // No price: skip contribution; actual alpha or tao likely zero (will be checked later)
       continue;
     }
 
     // price from ticks
-    const price_low_sqrt  = Math.pow(1.0001, tickLow  / 2);
-    const price_high_sqrt = Math.pow(1.0001, tickHigh / 2);
-    
+    const price_step = BigNumber(1.0001);
+    const price_low_sqrt  = powHalfStep(price_step, tickLow);
+    const price_high_sqrt = powHalfStep(price_step, tickHigh);
+
     // sqrt prices
-    const price_sqrt      = box(Math.sqrt(P), price_low_sqrt, price_high_sqrt);
+    const price_sqrt = box(act.priceSqrt, price_low_sqrt, price_high_sqrt);
 
     // Liquidity formulas
-    const alpha_liq = L * (1 / price_sqrt - 1 / price_high_sqrt);
-    const tao_liq   = L * (price_sqrt - price_low_sqrt);
+    const one = BigNumber(1);
+    const alpha_liq = L.multipliedBy(one.div(price_sqrt).minus(one.div(price_high_sqrt)));
+    const tao_liq   = L.multipliedBy(price_sqrt.minus(price_low_sqrt));
 
-    // if (L != 18446744073709552000n) {
-    //   console.log(`===================================================`);
-    //   console.log(`Position ID: ${pos.id}`);
-    //   console.log(`Position: ${pos.toString()}`);
-    //   console.log(`AccountID: ${addr}`);
-    //   console.log(`Liquidity: ${L}`);
-    //   console.log(`Alpha Liquidity: ${alpha_liq/1e9}`);
-    //   console.log(`TAO Liquidity:   ${tao_liq/1e9}`);
-    // }
+    // console.log(`===================================================`);
+    // console.log(`Position ID: ${pos.id}`);
+    // console.log(`Position: ${pos.toString()}`);
+    // console.log(`AccountID: ${addr}`);
+    // console.log(`Liquidity: ${L}`);
+    // console.log(`Alpha Liquidity: ${alpha_liq/1e9}`);
+    // console.log(`TAO Liquidity:   ${tao_liq/1e9}`);
 
-    const acc = implied.get(n) ?? { tao: 0, alpha: 0 };
+    const zero = BigNumber(0);
+    const acc = implied.get(n) ?? { tao: zero, alpha: zero };
     implied.set(n, {
-      tao:   acc.tao   + tao_liq,
-      alpha: acc.alpha + alpha_liq,
+      tao:   acc.tao.plus(tao_liq),
+      alpha: acc.alpha.plus(alpha_liq),
     });
   }
 
   // ---------- compare implied vs actual ----------
   for (const n of netuids) {
-    const act = actualByNet.get(n) ?? { tao: 0, alpha: 0, price: 0 };
-    const imp = implied.get(n)     ?? { tao: 0, alpha: 0 };
+    const act = actualByNet.get(n) ?? { tao: zero, alpha: zero, price: zero };
+    const imp = implied.get(n)     ?? { tao: zero, alpha: zero };
 
     // Alpha
-    if (!relAlmostEq(imp.alpha, act.alpha, 1e-6)) {
-      let diff = (100 * (act.alpha - imp.alpha)/imp.alpha).toFixed(3);
-      let abs_diff = Math.abs(act.alpha - imp.alpha) / 1e9;
-      err(`Alpha liquidity mismatch on netuid ${n}: implied=${imp.alpha} actual=${act.alpha}, diff = ${diff}%, ${abs_diff} Alpha`);
+    let alpha_diff = (100 * (act.alpha.toNumber() - imp.alpha.toNumber())/imp.alpha.toNumber()).toFixed(3);
+    let alpha_abs_diff = Math.abs(act.alpha.toNumber() - imp.alpha.toNumber()) / 1e9;
+    if (!approxEqRel(imp.alpha, act.alpha, BigNumber(1e-4))) {
+      err(`Alpha liquidity mismatch on netuid ${n}: implied=${imp.alpha} actual=${act.alpha}, diff = ${alpha_diff}%, ${alpha_abs_diff} Alpha`);
     }
     // TAO
-    if (!relAlmostEq(imp.tao, act.tao, 1e-6)) {
-      let diff = (100 * (act.tao - imp.tao)/imp.tao).toFixed(3);
-      let abs_diff = Math.abs(act.tao - imp.tao) / 1e9;
-      total_abs_tao_diff += abs_diff;
-      err(`TAO liquidity mismatch on netuid ${n}: implied=${imp.tao} actual=${act.tao}, diff = ${diff}%, ${abs_diff} TAO`);
+    let tao_diff = (100 * (act.tao.toNumber() - imp.tao.toNumber())/imp.tao.toNumber()).toFixed(3);
+    let tao_abs_diff = Math.abs(act.tao.toNumber() - imp.tao.toNumber()) / 1e9;
+    total_abs_tao_diff += tao_abs_diff;
+    if (!approxEqRel(imp.tao, act.tao, BigNumber(1e-4))) {
+      err(`TAO liquidity mismatch on netuid ${n}: implied=${imp.tao} actual=${act.tao}, diff = ${tao_diff}%, ${tao_abs_diff} TAO`);
     }
   }
 

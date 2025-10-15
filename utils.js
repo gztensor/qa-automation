@@ -1,4 +1,5 @@
 import { Keyring } from '@polkadot/api';
+import BigNumber from "bignumber.js";
 
 export function sendTransaction(api, call, actor) {
     return new Promise((resolve, reject) => {
@@ -210,6 +211,18 @@ export function fixedU64F64ToFloatFromHexString(bitsHex) {
   return Number(intPart) + Number(fracPart) / 2 ** 64;
 }
 
+export function fixedU64F64ToBigNumber(bitsHex) {
+  bitsHex = bitsHex.toHex();
+  const hex = bitsHex.startsWith("0x") ? bitsHex.slice(2) : bitsHex;
+  const bits = new BigNumber(hex, 16);
+
+  const TWO_64 = new BigNumber(2).pow(64);
+  const intPart  = bits.dividedToIntegerBy(TWO_64);
+  const fracPart = bits.mod(TWO_64);
+
+  return intPart.plus(fracPart.div(TWO_64));
+}
+
 /**
  * Compute stake = hotkeyAlpha * alphaShare / totalHotkeyShares
  * using full-precision BigInt math. Returns BigInt.
@@ -321,3 +334,54 @@ export async function getHotkeysStakedByColdkey(api, coldkey, netuid) {
   return active;
 }
 
+/**
+ * Approximate equality with same-type args:
+ *  - number:   classic relative tolerance (rel is a Number, e.g. 1e-6)
+ *  - BigInt:   rel is an integer numerator over a fixed DEN = 1e12 (i.e., rel=1_000_000n ≙ 1e-6)
+ *  - BigNumber (bignumber.js): rel is a BigNumber (e.g., new BigNumber("1e-6"))
+ */
+export function approxEqRel(a, b, rel) {
+  const tA = typeof a;
+  const tB = typeof b;
+  const tR = typeof rel;
+
+  // ---- Type gate: all same kind ----
+  const isBN = (x) => x instanceof BigNumber || x?.isBigNumber === true;
+  const sameNumber   = tA === "number" && tB === "number" && tR === "number";
+  const sameBigInt   = tA === "bigint" && tB === "bigint" && tR === "bigint";
+  const sameBigNum   = isBN(a) && isBN(b) && isBN(rel);
+
+  if (!(sameNumber || sameBigInt || sameBigNum)) {
+    throw new TypeError("a, b, and rel must be the same numeric type (number, bigint, or BigNumber).");
+  }
+
+  // ---- Number path ----
+  if (sameNumber) {
+    const diff  = Math.abs(a - b);
+    const scale = Math.max(Math.abs(a), Math.abs(b), 1);
+    return diff / scale <= rel;
+  }
+
+  // ---- BigInt path ----
+  // Interpret rel as a fixed-point ratio with denominator DEN = 1e12 (integer only).
+  // Example: rel = 1_000_000n means 1e-6 tolerance.
+  if (sameBigInt) {
+    const abs  = (n) => (n >= 0n ? n : -n);
+    const max2 = (x, y) => (x >= y ? x : y);
+
+    const diff  = abs(a - b);
+    const scale = max2(max2(abs(a), abs(b)), 1n);
+
+    const DEN = 1_000_000_000_000n; // 1e12 resolution
+    // Compare diff/scale <= rel/DEN  ->  diff * DEN <= scale * rel
+    return diff * DEN <= scale * rel;
+  }
+
+  // ---- BigNumber (bignumber.js) path ----
+  {
+    const A = a; const B = b; const R = rel;
+    const diff  = A.minus(B).abs();
+    const scale = BigNumber.max(A.abs(), B.abs(), new BigNumber(1));
+    return diff.lte(scale.times(R));
+  }
+}
