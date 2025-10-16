@@ -1,4 +1,4 @@
-import { approxEqualAbs, approxEqRel, fixedU64F64ToBigNumber, fixedU64F64ToFloatFromHexString, subnetsAvailable } from './utils.js'
+import { approxEqualAbs, approxEqRel, fixedU64F64ToBigNumber, fixedU64F64ToFloatFromHexString, fixedU96F32ToBigNumber, subnetsAvailable } from './utils.js'
 import BigNumber from "bignumber.js";
 
 export async function checkKeysUidsConstraints(api) {
@@ -1012,6 +1012,8 @@ export function powHalfStep(base, tick) {
  */
 export async function checkLiquidity(api) {
   let total_abs_tao_diff = 0;
+  let total_prices = 0;
+  let total_moving_prices = 0;
 
   let ok = true;
   const err = (msg) => { console.log(`Constraint error: ${msg}`); ok = false; };
@@ -1025,7 +1027,9 @@ export async function checkLiquidity(api) {
   }
   if (netuids.length === 0) return true; // nothing to check
 
+  // netuids = [netuids[0]];
   // netuids = [netuids[9]];
+  // netuids = [netuids[8]];
 
   console.log(`netuids = ${netuids}`);
 
@@ -1036,6 +1040,7 @@ export async function checkLiquidity(api) {
     const taoProv = BigNumber(await api.query.subtensorModule.subnetTaoProvided(n));
     const alphaIn = BigNumber(await api.query.subtensorModule.subnetAlphaIn(n));
     const alphaPr = BigNumber(await api.query.subtensorModule.subnetAlphaInProvided(n));
+    const movPr   = await api.query.subtensorModule.subnetMovingPrice(n);
 
     const taoActualNum   = tao.plus(taoProv);
     const alphaActualNum = alphaIn.plus(alphaPr);
@@ -1047,9 +1052,20 @@ export async function checkLiquidity(api) {
     const priceSqrt = fixedU64F64ToBigNumber(priceSqrtU64F64.bits);
     const price = priceSqrt.pow(2);
 
+    const movingPrice = fixedU96F32ToBigNumber(movPr.bits);
+    if (price < 1) total_prices += price.toNumber();
+    total_moving_prices += movingPrice.toNumber();
+
     // Expect price to match derived price at least very approximately
     if (!approxEqRel(price, priceDerived, BigNumber(0.1))) {
       err(`SN ${n} price ${price} doesn't match derived price ${priceDerived}`);
+    }
+
+    // Expect price to match moving price approximately
+    if (movingPrice > 0) {
+      if (!approxEqRel(price, movingPrice, BigNumber(0.1))) {
+        err(`SN ${n} price ${price} doesn't match moving price ${movingPrice}`);
+      }
     }
 
     actualByNet.set(n, { tao: taoActualNum, alpha: alphaActualNum, price, priceSqrt });
@@ -1092,6 +1108,19 @@ export async function checkLiquidity(api) {
     const alpha_liq = L.multipliedBy(one.div(price_sqrt).minus(one.div(price_high_sqrt)));
     const tao_liq   = L.multipliedBy(price_sqrt.minus(price_low_sqrt));
 
+    // const tmp1 = act.priceSqrt.minus(price_low_sqrt);
+    // const tmp2 = one.dividedBy(act.priceSqrt).minus(one.dividedBy(price_high_sqrt));
+    // console.log(`act.priceSqrt = ${act.priceSqrt}`);
+    // console.log(`price_high_sqrt = ${price_high_sqrt}`);
+    // console.log(`tmp1 = ${tmp1.toString()}`);
+    // console.log(`tmp2 = ${tmp2.toString()}`);
+    // const calculated_factor = tmp1.dividedBy(tmp2);
+    // const pr = act.priceSqrt.pow(2);
+    // console.log(`calculated_factor = ${calculated_factor}`);
+    // console.log(`price =             ${pr}`);
+    // const perr = pr.dividedBy(calculated_factor);
+    // console.log(`perr = ${perr.toString()}`);
+
     // console.log(`===================================================`);
     // console.log(`Position ID: ${pos.id}`);
     // console.log(`Position: ${pos.toString()}`);
@@ -1129,6 +1158,8 @@ export async function checkLiquidity(api) {
   }
 
   console.log(`total_abs_tao_diff = ${total_abs_tao_diff}`);
+  console.log(`total_prices = ${total_prices}`);
+  console.log(`total_moving_prices = ${total_moving_prices}`);
 
   return ok;
 }

@@ -223,6 +223,18 @@ export function fixedU64F64ToBigNumber(bitsHex) {
   return intPart.plus(fracPart.div(TWO_64));
 }
 
+export function fixedU96F32ToBigNumber(bitsHex) {
+  bitsHex = bitsHex.toHex();
+  const hex = bitsHex.startsWith("0x") ? bitsHex.slice(2) : bitsHex;
+  const bits = new BigNumber(hex, 16);
+
+  const TWO_32 = new BigNumber(2).pow(32);
+  const intPart  = bits.dividedToIntegerBy(TWO_32);
+  const fracPart = bits.mod(TWO_32);
+
+  return intPart.plus(fracPart.div(TWO_32));
+}
+
 /**
  * Compute stake = hotkeyAlpha * alphaShare / totalHotkeyShares
  * using full-precision BigInt math. Returns BigInt.
