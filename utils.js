@@ -397,3 +397,59 @@ export function approxEqRel(a, b, rel) {
     return diff.lte(scale.times(R));
   }
 }
+
+
+export async function getPendingEmissionAt(api, blockNumber) {
+  const apiAt = await getApiAtBlock(api, blockNumber);
+  const entries = await apiAt.query.subtensorModule.pendingEmission.entries();
+
+  return entries.map(([key, val]) => {
+    const netuid = key.args[0].toNumber();       // (netuid)
+    const valueString = val.toString();          // precise decimal string (preferred)
+    const valueNumber = Number(valueString);     // JS number (may lose precision)
+    return { netuid, valueNumber };
+  });
+}
+
+export async function getPendingServerEmissionAt(api, blockNumber) {
+  const apiAt = await getApiAtBlock(api, blockNumber);
+  const entries = await apiAt.query.subtensorModule.pendingServerEmission.entries();
+
+  return entries.map(([key, val]) => {
+    const netuid = key.args[0].toNumber();       // (netuid)
+    const valueString = val.toString();          // precise decimal string (preferred)
+    const valueNumber = Number(valueString);     // JS number (may lose precision)
+    return { netuid, valueNumber };
+  });
+}
+
+export async function getPendingValidatorEmissionAt(api, blockNumber) {
+  const apiAt = await getApiAtBlock(api, blockNumber);
+  const entries = await apiAt.query.subtensorModule.pendingValidatorEmission.entries();
+
+  return entries.map(([key, val]) => {
+    const netuid = key.args[0].toNumber();       // (netuid)
+    const valueString = val.toString();          // precise decimal string (preferred)
+    const valueNumber = Number(valueString);     // JS number (may lose precision)
+    return { netuid, valueNumber };
+  });
+}
+
+export async function getPendingRootAlphaDivsAt(api, blockNumber) {
+  const apiAt = await getApiAtBlock(api, blockNumber);
+  const entries = await apiAt.query.subtensorModule.pendingRootAlphaDivs.entries();
+
+  return entries.map(([key, val]) => {
+    const netuid = key.args[0].toNumber();   // (netuid)
+    const valueString = val.toString();      // precise decimal string (preferred)
+    const valueNumber = Number(valueString); // JS number (may lose precision)
+    return { netuid, valueNumber };
+  });
+}
+
+// Helper: get an api handle at a specific block (or latest)
+async function getApiAtBlock(api, blockNumber) {
+  if (blockNumber === undefined || blockNumber === null) return api;
+  const hash = await api.rpc.chain.getBlockHash(blockNumber);
+  return api.at(hash);
+}

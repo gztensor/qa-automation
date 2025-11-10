@@ -1011,7 +1011,7 @@ export function powHalfStep(base, tick) {
  * We compare implied vs actual with a small relative/absolute epsilon.
  */
 export async function checkLiquidity(api) {
-  let total_abs_tao_diff = 0;
+  let total_tao_diff = 0;
   let total_prices = 0;
   let total_moving_prices = 0;
 
@@ -1149,15 +1149,16 @@ export async function checkLiquidity(api) {
       err(`Alpha liquidity mismatch on netuid ${n}: implied=${imp.alpha} actual=${act.alpha}, diff = ${alpha_diff}%, ${alpha_abs_diff} Alpha`);
     }
     // TAO
-    let tao_diff = (100 * (act.tao.toNumber() - imp.tao.toNumber())/imp.tao.toNumber()).toFixed(3);
+    let tao_diff = (100 * (act.tao.toNumber() - imp.tao.toNumber())/imp.tao.toNumber()).toFixed(10);
     let tao_abs_diff = Math.abs(act.tao.toNumber() - imp.tao.toNumber()) / 1e9;
-    total_abs_tao_diff += tao_abs_diff;
+    total_tao_diff += (act.tao.toNumber() - imp.tao.toNumber()) / 1e9;
+    console.log(`tao_diff(${n}) = ${tao_diff}`);
     if (!approxEqRel(imp.tao, act.tao, BigNumber(1e-4))) {
       err(`TAO liquidity mismatch on netuid ${n}: implied=${imp.tao} actual=${act.tao}, diff = ${tao_diff}%, ${tao_abs_diff} TAO`);
     }
   }
 
-  console.log(`total_abs_tao_diff = ${total_abs_tao_diff}`);
+  console.log(`total_tao_diff = ${total_tao_diff}`);
   console.log(`total_prices = ${total_prices}`);
   console.log(`total_moving_prices = ${total_moving_prices}`);
 
@@ -1299,3 +1300,173 @@ export async function checkSimpleLimits(api) {
 
   return overallOk;
 }
+
+// Validate emission-related constraints at a given block.
+// If blockNumber is null/undefined, checks the latest state (and skips the “+1e9 vs previous block” test).
+// Returns { ok, violations } and logs each failure prefixed with "Constraint error:".
+export async function checkEmission(api, blockNumber, { rootNetuid = 0, rel = 1e-6, taoApproxRel = 0.10 } = {}) {
+  const ONE = 1_000_000_000; // 1 TAO or 1 ALPHA in base units
+  const apiAt = await getApiAtBlock(api, blockNumber);
+
+  // --- helpers
+  const toNum = (x) => Number(x?.toString?.() ?? x ?? 0);
+  const approxEq = (a, b, r = rel) => {
+    const A = Math.abs(a), B = Math.abs(b);
+    const scale = Math.max(A, B, 1);
+    return Math.abs(a - b) / scale <= r;
+  };
+  const toMap = (entries) => {
+    const m = new Map();
+    for (const [key, val] of entries) {
+      const netuid = key.args[0].toNumber();
+      m.set(netuid, toNum(val));
+    }
+    return m;
+  };
+
+  const violations = [];
+  const fail = (msg) => { console.error(`Constraint error: ${msg}`); violations.push(msg); };
+
+  // --- load data (all at target block)
+  const [
+    taoInEntries,
+    alphaInEntries,
+    alphaOutEntries,
+    pendSrvEntries,
+    pendValEntries,
+    pendOwnerEntries,
+    blocksEntries,
+    febnEntries,
+    ownerCutU16,
+    totalIssSubtensor,
+    totalIssBalances
+  ] = await Promise.all([
+    apiAt.query.subtensorModule.subnetTaoInEmission.entries(),
+    apiAt.query.subtensorModule.subnetAlphaInEmission.entries(),
+    apiAt.query.subtensorModule.subnetAlphaOutEmission.entries(),
+    apiAt.query.subtensorModule.pendingServerEmission.entries(),
+    apiAt.query.subtensorModule.pendingValidatorEmission.entries(),
+    apiAt.query.subtensorModule.pendingOwnerCut.entries(),
+    apiAt.query.subtensorModule.blocksSinceLastStep.entries(),
+    apiAt.query.subtensorModule.firstEmissionBlockNumber.entries(), // (netuid) -> Option<u64>
+    apiAt.query.subtensorModule.subnetOwnerCut(),                   // u16
+    apiAt.query.subtensorModule.totalIssuance(),                    // TaoCurrency
+    apiAt.query.balances.totalIssuance()                            // balances pallet total issuance
+  ]);
+
+  const taoIn   = toMap(taoInEntries);
+  const alphaIn = toMap(alphaInEntries);
+  const alphaOut= toMap(alphaOutEntries);
+  const pendSrv = toMap(pendSrvEntries);
+  const pendVal = toMap(pendValEntries);
+  const pendOwn = toMap(pendOwnerEntries);
+
+  // BlocksSinceLastStep: u64
+  const blocks = new Map(blocksEntries.map(([k, v]) => [k.args[0].toNumber(), v.toNumber()]));
+
+  // FirstEmissionBlockNumber: Option<u64> -> boolean exists
+  const febn = new Map(febnEntries.map(([k, v]) => [k.args[0].toNumber(), v.isSome]));
+
+  const ownerCut = toNum(ownerCutU16) / 65535; // u16::MAX
+  const allocFrac = 1 - ownerCut;
+
+  // --- Constraint: sum(SubnetTaoInEmission) ≈ 1e9 (within taoApproxRel) and never exceeds it
+  const taoSum = [...taoIn.values()].reduce((a, b) => a + b, 0);
+  if (taoSum > ONE + 1e-3) {
+    fail(`Sum(SubnetTaoInEmission)=${taoSum} exceeds block_emission=${ONE}`);
+  }
+  if (!approxEq(taoSum, ONE, taoApproxRel)) {
+    fail(`Sum(SubnetTaoInEmission) not ~ block emission: sum=${taoSum}, expected≈${ONE} (rel tol=${taoApproxRel})`);
+  }
+
+  // --- Per-subnet constraints
+  const allNetuids = new Set([
+    ...taoIn.keys(), ...alphaIn.keys(), ...alphaOut.keys(),
+    ...pendSrv.keys(), ...pendVal.keys(), ...pendOwn.keys(),
+    ...blocks.keys(), ...febn.keys()
+  ]);
+
+  for (const n of allNetuids) {
+    const b = blocks.get(n) ?? 0;
+    const expectedSrvVal = b * ONE * allocFrac;
+    const expectedOwner  = b * ONE * ownerCut;
+
+    const s = pendSrv.get(n) ?? 0;
+    const v = pendVal.get(n) ?? 0;
+    const o = pendOwn.get(n) ?? 0;
+
+    // PendingServerEmission + PendingValidatorEmission == BlocksSinceLastStep * alpha_block_emission * (1 - owner_cut)
+    if (!approxEq(s + v, expectedSrvVal)) {
+      fail(`netuid=${n} server+validator=${s + v} != blocks(${b})*alpha(1e9)*(1-owner_cut=${allocFrac.toFixed(6)})=${expectedSrvVal}`);
+    }
+
+    // PendingOwnerCut == BlocksSinceLastStep * alpha_block_emission * owner_cut
+    if (!approxEq(o, expectedOwner)) {
+      fail(`netuid=${n} ownerCut=${o} != blocks(${b})*alpha(1e9)*owner_cut(${ownerCut.toFixed(6)})=${expectedOwner}`);
+    }
+
+    // Subnets without FirstEmissionBlockNumber should receive 0 emission
+    const hasFE = febn.get(n) === true;
+    if (!hasFE) {
+      const ai = alphaIn.get(n) ?? 0;
+      const ao = alphaOut.get(n) ?? 0;
+      const ti = taoIn.get(n) ?? 0;
+      if (s !== 0 || v !== 0 || o !== 0 || ai !== 0 || ao !== 0 || ti !== 0) {
+        fail(`netuid=${n} has no FirstEmissionBlockNumber but has emissions: srv=${s}, val=${v}, owner=${o}, alphaIn=${ai}, alphaOut=${ao}, taoIn=${ti}`);
+      }
+    }
+
+    // Root subnet should receive 0 emission
+    if (n === rootNetuid) {
+      const ai = alphaIn.get(n) ?? 0;
+      const ao = alphaOut.get(n) ?? 0;
+      const ti = taoIn.get(n) ?? 0;
+      if (s !== 0 || v !== 0 || o !== 0 || ai !== 0 || ao !== 0 || ti !== 0) {
+        fail(`root netuid=${n} must have zero emissions but has: srv=${s}, val=${v}, owner=${o}, alphaIn=${ai}, alphaOut=${ao}, taoIn=${ti}`);
+      }
+    }
+
+    // SubnetAlphaInEmission never exceeds alpha_block_emission
+    const ai = alphaIn.get(n) ?? 0;
+    if (ai > ONE + 1e-3) {
+      fail(`netuid=${n} SubnetAlphaInEmission=${ai} exceeds alpha_block_emission=${ONE}`);
+    }
+
+    // SubnetAlphaOutEmission is always equal to alpha_block_emission
+    const ao = alphaOut.get(n) ?? 0;
+    if (!approxEq(ao, ONE)) {
+      fail(`netuid=${n} SubnetAlphaOutEmission=${ao} != alpha_block_emission=${ONE}`);
+    }
+  }
+
+  // --- Sum(SubnetTaoInEmission) never exceeds block emission (already checked above, keep explicit)
+  if (taoSum > ONE + 1e-3) {
+    fail(`Sum(SubnetTaoInEmission)=${taoSum} exceeds block_emission=${ONE}`);
+  }
+
+  // --- TotalIssuance equality between pallets
+  const issSub = toNum(totalIssSubtensor);
+  const issBal = toNum(totalIssBalances);
+  if (issSub !== issBal) {
+    fail(`TotalIssuance mismatch: subtensor=${issSub} vs balances=${issBal}`);
+  }
+
+  // --- TotalIssuance increases by 1e9 per block (if we have a previous block to compare)
+  if (blockNumber != null && blockNumber > 0) {
+    const prevAt = await getApiAtBlock(api, blockNumber - 1);
+    const prevIss = toNum(await prevAt.query.subtensorModule.totalIssuance());
+    if (!approxEq(issSub, prevIss + ONE)) {
+      fail(`TotalIssuance at block ${blockNumber} = ${issSub} != prev(${prevIss}) + 1e9`);
+    }
+  }
+
+  return violations.length === 0;
+}
+
+// helper reused
+async function getApiAtBlock(api, blockNumber) {
+  if (blockNumber === undefined || blockNumber === null) return api;
+  const hash = await api.rpc.chain.getBlockHash(blockNumber);
+  return api.at(hash);
+}
+
