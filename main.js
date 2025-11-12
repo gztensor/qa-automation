@@ -20,9 +20,9 @@ import {
 } from './constraints.js';
 
 // const ENDPOINT = 'ws://127.0.0.1:9944';
-// const ENDPOINT = 'ws://127.0.0.1:9946';
+const ENDPOINT = 'ws://127.0.0.1:9946';
 // const ENDPOINT = 'wss://entrypoint-finney.opentensor.ai';
-const ENDPOINT = 'wss://archive.chain.opentensor.ai';
+// const ENDPOINT = 'wss://archive.chain.opentensor.ai';
 
 async function chooseContractParameters(contract) {
   const prmCount = contract.parameterCount;
@@ -166,16 +166,16 @@ async function main() {
   // console.log(`Staking constraints OK = ${stakingOk}`);
 
   let epochOk = true;
-  // epochOk = await checkEpochTopology(api);
-  // console.log(`Epoch topology constraints OK = ${epochOk}`);
+  epochOk = await checkEpochTopology(api);
+  console.log(`Epoch topology constraints OK = ${epochOk}`);
 
   let parentChildOk = true;
-  // parentChildOk = await checkParentChildRelationship(api);
-  // console.log(`Parent-child relationship constraints OK = ${parentChildOk}`);
+  parentChildOk = await checkParentChildRelationship(api);
+  console.log(`Parent-child relationship constraints OK = ${parentChildOk}`);
 
   let validatorPermitsOk = true;
-  // validatorPermitsOk = await checkValidatorPermits(api);
-  // console.log(`Validator permit constraints OK = ${validatorPermitsOk}`);
+  validatorPermitsOk = await checkValidatorPermits(api);
+  console.log(`Validator permit constraints OK = ${validatorPermitsOk}`);
 
   let liquidityOk = true;
   // liquidityOk = await checkLiquidity(api);

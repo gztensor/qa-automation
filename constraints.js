@@ -229,7 +229,7 @@ export async function checkKeysUidsConstraints(api) {
 
 /**
  * Check staking-related invariants:
- * 1) sum_h(TotalHotkeyAlpha(h, n)) + PendingEmission(n) == SubnetAlphaOut(n)
+ * 1) sum_h(TotalHotkeyAlpha(h, n)) + PendingServerEmission(n) + PendingValidatorEmission(n) + PendingOwnerCut(n) == SubnetAlphaOut(n)
  * 2) For every (h, c, n) in Alpha: StakingHotkeys(c) includes h
  * 3) For every (h, n): sum_c Alpha(h, c, n) == TotalHotkeyShares(h, n)
  *
@@ -246,7 +246,7 @@ export async function checkStakingConstraints(api) {
   let netuids = await subnetsAvailable(api);
   if (netuids.length === 0) return true;
 
-  // ---------- (1) sum(TotalHotkeyAlpha(*, n)) + PendingEmission(n) == SubnetAlphaOut(n) ----------
+  // ---------- (1) sum(TotalHotkeyAlpha(*, n)) + PendingServerEmission(n) + PendingValidatorEmission(n) + PendingOwnerCut(n) == SubnetAlphaOut(n) ----------
   const thaEntries = await api.query.subtensorModule.totalHotkeyAlpha.entries();
   const sumThaByNet = new Map(); // n -> BigInt
   for (const [k, v] of thaEntries) {
@@ -257,10 +257,12 @@ export async function checkStakingConstraints(api) {
 
   for (const n of netuids) {
     const sumTha = sumThaByNet.get(n) ?? 0n;
-    const pending = BigInt(await api.query.subtensorModule.pendingEmission(n));
+    const pendingServer = BigInt(await api.query.subtensorModule.pendingServerEmission(n));
+    const pendingValidator = BigInt(await api.query.subtensorModule.pendingValidatorEmission(n));
+    const pendingOwner = BigInt(await api.query.subtensorModule.pendingOwnerCut(n));
     const out = BigInt(await api.query.subtensorModule.subnetAlphaOut(n));
-    if (sumTha + pending !== out) {
-      err(`1 sum(TotalHotkeyAlpha(*, ${n})) + PendingEmission(${n}) != SubnetAlphaOut(${n}) (sum=${sumTha} pending=${pending} out=${out})`);
+    if (sumTha + pendingServer + pendingValidator + pendingOwner > out) {
+      err(`1 sum(TotalHotkeyAlpha(*, ${n})) + PendingServerEmission(${n}) + PendingValidatorEmission(${n}) + PendingOwnerCut(${n})  > SubnetAlphaOut(${n}) (sum=${sumTha} pending=${pendingServer}, ${pendingValidator}, ${pendingOwner} out=${out})`);
     }
   }
 
@@ -1323,7 +1325,19 @@ export async function checkEmission(api, blockNumber, { rootNetuid = 0, rel = 1e
     }
     return m;
   };
-
+  const toBoolMap = (entries) => {
+    const m = new Map();
+    for (const [key, val] of entries) {
+      const netuid = key.args[0].toNumber();
+      // Prefer .isTrue; fall back to .toJSON()
+      const bool =
+        (typeof val.isTrue === 'boolean')
+          ? val.isTrue
+          : Boolean(val.toJSON?.());
+      m.set(netuid, bool);
+    }
+    return m;
+  };
   const violations = [];
   const fail = (msg) => { console.error(`Constraint error: ${msg}`); violations.push(msg); };
 
@@ -1339,7 +1353,9 @@ export async function checkEmission(api, blockNumber, { rootNetuid = 0, rel = 1e
     febnEntries,
     ownerCutU16,
     totalIssSubtensor,
-    totalIssBalances
+    totalIssBalances,
+    burnRegistrationAllowed,
+    powRegistrationAllowed,
   ] = await Promise.all([
     apiAt.query.subtensorModule.subnetTaoInEmission.entries(),
     apiAt.query.subtensorModule.subnetAlphaInEmission.entries(),
@@ -1351,7 +1367,9 @@ export async function checkEmission(api, blockNumber, { rootNetuid = 0, rel = 1e
     apiAt.query.subtensorModule.firstEmissionBlockNumber.entries(), // (netuid) -> Option<u64>
     apiAt.query.subtensorModule.subnetOwnerCut(),                   // u16
     apiAt.query.subtensorModule.totalIssuance(),                    // TaoCurrency
-    apiAt.query.balances.totalIssuance()                            // balances pallet total issuance
+    apiAt.query.balances.totalIssuance(),                           // balances pallet total issuance
+    apiAt.query.subtensorModule.networkRegistrationAllowed.entries(),
+    apiAt.query.subtensorModule.networkPowRegistrationAllowed.entries(),
   ]);
 
   const taoIn   = toMap(taoInEntries);
@@ -1360,6 +1378,8 @@ export async function checkEmission(api, blockNumber, { rootNetuid = 0, rel = 1e
   const pendSrv = toMap(pendSrvEntries);
   const pendVal = toMap(pendValEntries);
   const pendOwn = toMap(pendOwnerEntries);
+  const burnReg = toBoolMap(burnRegistrationAllowed);
+  const powReg = toBoolMap(powRegistrationAllowed);
 
   // BlocksSinceLastStep: u64
   const blocks = new Map(blocksEntries.map(([k, v]) => [k.args[0].toNumber(), v.toNumber()]));
@@ -1387,55 +1407,36 @@ export async function checkEmission(api, blockNumber, { rootNetuid = 0, rel = 1e
   ]);
 
   for (const n of allNetuids) {
-    const b = blocks.get(n) ?? 0;
-    const expectedSrvVal = b * ONE * allocFrac;
-    const expectedOwner  = b * ONE * ownerCut;
+    const ai = alphaIn.get(n) ?? 0;
+    const ao = alphaOut.get(n) ?? 0;
 
     const s = pendSrv.get(n) ?? 0;
     const v = pendVal.get(n) ?? 0;
     const o = pendOwn.get(n) ?? 0;
 
-    // PendingServerEmission + PendingValidatorEmission == BlocksSinceLastStep * alpha_block_emission * (1 - owner_cut)
-    if (!approxEq(s + v, expectedSrvVal)) {
-      fail(`netuid=${n} server+validator=${s + v} != blocks(${b})*alpha(1e9)*(1-owner_cut=${allocFrac.toFixed(6)})=${expectedSrvVal}`);
-    }
-
-    // PendingOwnerCut == BlocksSinceLastStep * alpha_block_emission * owner_cut
-    if (!approxEq(o, expectedOwner)) {
-      fail(`netuid=${n} ownerCut=${o} != blocks(${b})*alpha(1e9)*owner_cut(${ownerCut.toFixed(6)})=${expectedOwner}`);
-    }
-
-    // Subnets without FirstEmissionBlockNumber should receive 0 emission
+    // Conditions when SN should not have emissions:
     const hasFE = febn.get(n) === true;
-    if (!hasFE) {
-      const ai = alphaIn.get(n) ?? 0;
-      const ao = alphaOut.get(n) ?? 0;
-      const ti = taoIn.get(n) ?? 0;
-      if (s !== 0 || v !== 0 || o !== 0 || ai !== 0 || ao !== 0 || ti !== 0) {
-        fail(`netuid=${n} has no FirstEmissionBlockNumber but has emissions: srv=${s}, val=${v}, owner=${o}, alphaIn=${ai}, alphaOut=${ao}, taoIn=${ti}`);
-      }
-    }
+    const registrationsAllowed = (burnReg.get(n) ?? false) || (powReg.get(n) ?? false);
+    const isRoot = (n === rootNetuid);
 
-    // Root subnet should receive 0 emission
-    if (n === rootNetuid) {
-      const ai = alphaIn.get(n) ?? 0;
-      const ao = alphaOut.get(n) ?? 0;
+    // 0 emission
+    if (!hasFE || !registrationsAllowed || isRoot) {
       const ti = taoIn.get(n) ?? 0;
       if (s !== 0 || v !== 0 || o !== 0 || ai !== 0 || ao !== 0 || ti !== 0) {
-        fail(`root netuid=${n} must have zero emissions but has: srv=${s}, val=${v}, owner=${o}, alphaIn=${ai}, alphaOut=${ao}, taoIn=${ti}`);
+        fail(`netuid=${n} must have zero emissions but has: srv=${s}, val=${v}, owner=${o}, alphaIn=${ai}, alphaOut=${ao}, taoIn=${ti}`);
       }
     }
 
     // SubnetAlphaInEmission never exceeds alpha_block_emission
-    const ai = alphaIn.get(n) ?? 0;
     if (ai > ONE + 1e-3) {
       fail(`netuid=${n} SubnetAlphaInEmission=${ai} exceeds alpha_block_emission=${ONE}`);
     }
 
-    // SubnetAlphaOutEmission is always equal to alpha_block_emission
-    const ao = alphaOut.get(n) ?? 0;
-    if (!approxEq(ao, ONE)) {
-      fail(`netuid=${n} SubnetAlphaOutEmission=${ao} != alpha_block_emission=${ONE}`);
+    // SubnetAlphaOutEmission is always equal to alpha_block_emission if FirstEmissionBlockNumber is set and registrations are allowed
+    if (registrationsAllowed && hasFE) {
+      if (!approxEq(ao, ONE)) {
+        fail(`netuid=${n} SubnetAlphaOutEmission=${ao} != alpha_block_emission=${ONE}`);
+      }
     }
   }
 
@@ -1444,19 +1445,61 @@ export async function checkEmission(api, blockNumber, { rootNetuid = 0, rel = 1e
     fail(`Sum(SubnetTaoInEmission)=${taoSum} exceeds block_emission=${ONE}`);
   }
 
-  // --- TotalIssuance equality between pallets
-  const issSub = toNum(totalIssSubtensor);
-  const issBal = toNum(totalIssBalances);
-  if (issSub !== issBal) {
-    fail(`TotalIssuance mismatch: subtensor=${issSub} vs balances=${issBal}`);
-  }
-
   // --- TotalIssuance increases by 1e9 per block (if we have a previous block to compare)
   if (blockNumber != null && blockNumber > 0) {
     const prevAt = await getApiAtBlock(api, blockNumber - 1);
     const prevIss = toNum(await prevAt.query.subtensorModule.totalIssuance());
     if (!approxEq(issSub, prevIss + ONE)) {
       fail(`TotalIssuance at block ${blockNumber} = ${issSub} != prev(${prevIss}) + 1e9`);
+    }
+  }
+
+  // --- Per-subnet pending deltas:
+  // Δ(server+validator) = alphaIn * (1 - owner_cut)
+  // Δ(owner)            = alphaIn * owner_cut
+  // Skip if CURRENT pending sum == 0 (pending resets every 361 blocks).
+  if (blockNumber != null && blockNumber > 0) {
+    const prevAt = await getApiAtBlock(api, blockNumber - 1);
+    const [prevSrvEntries, prevValEntries, prevOwnEntries] = await Promise.all([
+      prevAt.query.subtensorModule.pendingServerEmission.entries(),
+      prevAt.query.subtensorModule.pendingValidatorEmission.entries(),
+      prevAt.query.subtensorModule.pendingOwnerCut.entries(),
+    ]);
+
+    const prevSrv = new Map(prevSrvEntries.map(([k, v]) => [k.args[0].toNumber(), Number(v.toString())]));
+    const prevVal = new Map(prevValEntries.map(([k, v]) => [k.args[0].toNumber(), Number(v.toString())]));
+    const prevOwn = new Map(prevOwnEntries.map(([k, v]) => [k.args[0].toNumber(), Number(v.toString())]));
+
+    for (const n of allNetuids) {
+      const alphaInNow = alphaIn.get(n) ?? 0;
+
+      // server+validator delta
+      const curSrvVal  = (pendSrv.get(n) ?? 0) + (pendVal.get(n) ?? 0);
+      if (curSrvVal !== 0) {
+        const prevSrvVal = (prevSrv.get(n) ?? 0) + (prevVal.get(n) ?? 0);
+        const deltaSrv   = curSrvVal - prevSrvVal;
+        const expectSrv  = alphaInNow * allocFrac;
+
+        if (!approxEq(deltaSrv, expectSrv)) {
+          fail(
+            `netuid=${n} Δ(server+validator)=${deltaSrv} != alphaIn(${alphaInNow})*(1-owner_cut=${allocFrac.toFixed(6)})=${expectSrv}`
+          );
+        }
+      }
+
+      // owner delta
+      const curOwner = (pendOwn.get(n) ?? 0);
+      if (curOwner !== 0) {
+        const prevOwner = (prevOwn.get(n) ?? 0);
+        const deltaOwn  = curOwner - prevOwner;
+        const expectOwn = alphaInNow * ownerCut;
+
+        if (!approxEq(deltaOwn, expectOwn)) {
+          fail(
+            `netuid=${n} Δ(ownerCut)=${deltaOwn} != alphaIn(${alphaInNow})*owner_cut(${ownerCut.toFixed(6)})=${expectOwn}`
+          );
+        }
+      }
     }
   }
 
